@@ -142,6 +142,11 @@ export class Mushaf {
     return [...votes.entries()].map(([g, v]) => ({ g, votes: v })).sort((x, y) => y.votes - x.votes || x.g - y.g);
   }
 
+  /** Positions où commencent trois mots de squelettes donnés (index de trigrammes). */
+  trigramHits(a: string, b: string, c: string): number[] {
+    return this.trigrams().get(a + '|' + b + '|' + c) ?? [];
+  }
+
   private trigrams(): Map<string, number[]> {
     if (this.trigramIndex) return this.trigramIndex;
     const idx = new Map<string, number[]>();

@@ -17,10 +17,16 @@ Application web (PWA, React + Vite + TypeScript) inspirée de [al-Musammiʿ](htt
 un « cheikh » qui écoute la récitation de mémoire du Coran, se tait tant qu'elle est juste, dit
 « أعِد » (« recommence ») à la moindre erreur et souffle la suite (*fath*) quand on bloque.
 
-Le code est écrit de zéro. Contrairement à l'original, qui s'appuie sur Gemini Live (avec une clé
-API), cette version fonctionne **sans clé ni serveur** : la reconnaissance vocale est celle du
-navigateur (API Web Speech, arabe `ar-SA`) et tout le jugement se fait sur le téléphone, mot à mot,
-contre le texte imprimé de la riwaya choisie.
+Le code est écrit de zéro et fonctionne **sans serveur**, avec deux moteurs :
+
+- **الشيخ الحي (cheikh en direct)**, avec une clé Gemini gratuite gardée dans le navigateur : le
+  téléphone parle directement à **Gemini Live** (`gemini-3.8-live`). Le cheikh vous entend, vous
+  répond en arabe de sa voix, fait passer l'examen, explique le sens des versets. Il juge la
+  récitation sur le **texte imprimé** que l'application lui donne (outils `open_mushaf`, `get_fath`,
+  `exam_question`…), jamais de mémoire. Dans la conversation, tout passage du Coran (récité ou cité)
+  est affiché tel qu'imprimé dans le mushaf de la riwaya, avec ses numéros de versets.
+- **Sans clé** : reconnaissance vocale du navigateur (API Web Speech, `ar-SA`) et jugement mot à mot
+  sur le téléphone, contre le texte imprimé de la riwaya choisie.
 
 ## Fonctionnalités
 
@@ -39,6 +45,32 @@ contre le texte imprimé de la riwaya choisie.
 | **Commandes vocales** | « سأقرأ سورة الملك », « افتح », « اختبرني », « أسمعني », « حسبك », « ما معنى الآية »… |
 
 ## Comment ça marche
+
+### Cheikh en direct (Gemini Live)
+
+```
+micro 16 kHz ──► PauseSegmenter (tours coupés aux pauses du récitant) ──► activityStart / audio / activityEnd
+                                                                              │ WebSocket (SDK @google/genai)
+haut-parleur 24 kHz ◄── voix du cheikh ◄──────────────────────────── Gemini Live (gemini-3.8-live)
+                                                                              │ appels d'outils
+        application : open_mushaf · get_fath · exam_question · exam_answer · tafsir ·
+                      play_recitation · stop_recitation · set_riwaya · prayer · end_session
+```
+
+- `src/live/segmenter.ts` — la détection automatique de Gemini coupe mal une récitation psalmodiée :
+  l'application découpe elle-même les tours (plancher de bruit adaptatif ; fin après 0,45 s de pause
+  en récitation, 1,1 s en conversation ; coupure à la première respiration après 3,5 s).
+- `src/live/session.ts` — micro (AudioWorklet, annulation d'écho) → Gemini → lecture sans trou ;
+  `NO_INTERRUPTION` pour que « أعِد » soit dit par-dessus la récitation ; le récitant peut couper une
+  longue explication ; reprise de session (`sessionResumption`, `goAway`) et compression du contexte ;
+  arrêt après 3 min de silence (20 min en prière).
+- `src/live/prompt.ts` — les consignes du cheikh et la déclaration des outils.
+- `src/quran/quranize.ts` — repère les passages du Coran dans la conversation (index de trigrammes)
+  pour les afficher avec le texte imprimé.
+- Le fath reste fait par l'application : après un silence, elle envoie au cheikh les mots exacts
+  jusqu'au prochain waqf, qu'il souffle à voix basse.
+
+### Sans clé
 
 ```
 micro ──► SpeechRecognition (ar-SA, continue) ──► segment final (après une pause)
@@ -85,7 +117,9 @@ d'aligner chaque verset sur sa variante Hafs.
 
 - La reconnaissance vocale du navigateur est faite pour la parole courante : elle entend la récitation
   « en Hafs » et ne juge pas les *uṣūl* (imala, tas-hil, taqlil, madd, ghunna). Le suivi juge les **mots**.
-- Firefox n'a pas l'API Web Speech : un **mode écrit** (réglages) permet alors de taper ce que l'on récite.
+- Le mode en direct a été testé de bout en bout contre un serveur Gemini Live simulé (protocole,
+  outils, tours de parole) ; la qualité du jugement dépend du modèle de Google.
+- En mode sans clé, Firefox n'a pas l'API Web Speech : un **mode écrit** (réglages) permet alors de taper ce que l'on récite.
 - Sur Chrome, l'audio est envoyé aux serveurs de Google pour la transcription ; l'application, elle,
   n'enregistre rien et ne garde que l'historique local.
 - Les récitations enregistrées n'existent qu'en Hafs et en Warsh ; pour les autres riwayat, « أسمعني »

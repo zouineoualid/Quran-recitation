@@ -7,12 +7,14 @@ import { chime, sayFath, sayRepeat, sayText, speakingNow, unlockAudio } from './
 import { findSurah, parseCommand, type Command } from './speech/commands';
 import { AyahPlayer, type AyahRef } from './audio/player';
 import { makeQuestion, ayahLabel, arNum, type Question } from './exam/exam';
-import { TAFASIR, recitersFor, riwayaById } from './data/riwayat';
+import { RIWAYAT, TAFASIR, recitersFor, riwayaById } from './data/riwayat';
 import { JUZ_STARTS, SURAHS } from './data/surahs';
-import { saveSession, useSettings, type RangeChoice, type SessionRecord } from './store';
+import { liveTestOverrides, loadKey, saveKey, saveSession, useSettings, type RangeChoice, type SessionRecord } from './store';
 import { RecitationView } from './components/RecitationView';
 import { HelpSheet, HistorySheet, RangeSheet, RiwayaSheet, SettingsSheet, TafsirSheet, rangeLabel } from './components/Sheets';
 import { Sheet } from './components/Sheet';
+import { DialogueLine } from './components/DialogueLine';
+import type { LiveHost, LiveState, LiveTeacher } from './live/session';
 
 type SheetName = 'riwaya' | 'range' | 'settings' | 'history' | 'help' | 'tafsir' | 'summary';
 type Tone = 'info' | 'warn' | 'ok' | 'err';
@@ -24,6 +26,13 @@ interface ExamState {
   phase: 'asking' | 'answered';
   correct?: boolean;
   reveal?: boolean;
+}
+
+interface Line {
+  role: 'user' | 'model';
+  id: number;
+  text: string;
+  final: boolean;
 }
 
 /** Bornes [début, fin) en mots d'un choix de plage. */
@@ -39,6 +48,20 @@ function rangeBounds(m: Mushaf, r: RangeChoice): [number, number] {
 }
 
 const fontFor = (riwaya: string) => (riwaya === 'hafs' || riwaya === 'shuba' ? 'font-hafs' : 'font-maghribi');
+
+const LIVE_LABEL: Record<LiveState, string> = {
+  connecting: 'جارٍ الاتصال بالشيخ…',
+  listening: 'أستمع',
+  hearing: 'صوتك يصلني',
+  thinking: '…',
+  speaking: 'الشيخ يتكلم',
+  reconnecting: 'إعادة الاتصال…',
+  closed: '',
+  error: '',
+};
+
+/** Texte d'un mot imprimé sans les signes ۞ et de pause, pour le donner au cheikh. */
+const plain = (t: string) => t.replace(/[ۖ-۞۩]/g, '').replace(/\s+/g, ' ').trim();
 
 export default function App() {
   const [settings, update] = useSettings();
@@ -61,16 +84,23 @@ export default function App() {
   const [typing, setTyping] = useState(() => !speechSupported());
   const [typed, setTyped] = useState('');
   const [summary, setSummary] = useState<SessionRecord | null>(null);
+  const [apiKey, setApiKey] = useState(loadKey);
+  const [liveState, setLiveState] = useState<LiveState>('closed');
+  const [lines, setLines] = useState<Line[]>([]);
 
   const session = useRef<SessionRecord | null>(null);
   const lastActivity = useRef(Date.now());
   const fathAt = useRef(-1);
   const player = useMemo(() => new AyahPlayer(), []);
   const statusTimer = useRef<number | undefined>(undefined);
+  const teacher = useRef<LiveTeacher | null>(null);
 
-  // Valeurs courantes lues depuis les callbacks de la reconnaissance vocale.
-  const live = useRef({ settings, prayer, exam, mushaf });
-  live.current = { settings, prayer, exam, mushaf };
+  /** Le cheikh en direct est-il le moteur choisi ? */
+  const liveMode = settings.engine === 'live' && !!apiKey && !typing;
+
+  // Valeurs courantes lues depuis les callbacks (reconnaissance vocale, Gemini Live).
+  const live = useRef({ settings, prayer, exam, mushaf, liveMode });
+  live.current = { settings, prayer, exam, mushaf, liveMode };
 
   const say = useCallback((text: string, tone: Tone = 'info', ms = 3500) => {
     setStatus({ text, tone });
@@ -82,6 +112,9 @@ export default function App() {
     setFlash(kind);
     window.setTimeout(() => setFlash(null), 700);
   }, []);
+
+  /** Le cheikh en direct est-il connecté ? */
+  const liveActive = () => !!teacher.current?.active;
 
   /* ---------- Chargement du mushaf ---------- */
 
@@ -105,6 +138,7 @@ export default function App() {
       .then((m) => {
         if (cancelled) return;
         setMushaf(m);
+        live.current.mushaf = m;
         resetTracker(m, live.current.settings.range);
       })
       .catch((e: Error) => !cancelled && setLoadError(e.message));
@@ -166,7 +200,7 @@ export default function App() {
     if (w) session.current.slips.push({ s: w.s, a: w.a, i: w.i, word: w.text, heard, kind });
   };
 
-  /* ---------- Reconnaissance vocale ---------- */
+  /* ---------- Reconnaissance vocale du navigateur (mode sans clé) ---------- */
 
   const handlers = useRef({ final: (_t: string) => {}, interim: (_t: string) => {} });
 
@@ -196,9 +230,221 @@ export default function App() {
     }
   };
 
+  /* ---------- Cheikh en direct (Gemini Live) ---------- */
+
+  const greetingFor = (intent: 'recite' | 'exam' | 'prayer') => {
+    const s = live.current.settings;
+    const where = s.range.kind === 'free' ? 'لم يحدد الطالب موضعاً بعد' : `المقطع المختار في التطبيق: ${rangeLabel(s.range)}`;
+    const base = `بدأت الجلسة. الرواية: ${riwayaById(s.riwaya).name}. ${where}.`;
+    if (intent === 'exam') return `${base} الطالب يريد اختباراً: استدعِ exam_question الآن واطرح السؤال.`;
+    if (intent === 'prayer') return `${base} الطالب يصلي الآن: اسكت تماماً إلا «أعِد» عند الخطأ والفتح عند التوقف.`;
+    const open = s.range.kind === 'surah' ? ` استدعِ open_mushaf لهذا المقطع (سورة ${s.range.s} من ${s.range.a1} إلى ${s.range.a2}) قبل أن تسمع.` : '';
+    return `${base}${open} رحّب بالطالب بكلمة قصيرة جداً مثل «تفضّل، أنا معك» ثم اسكت واستمع.`;
+  };
+
+  const startLive = async (intent: 'recite' | 'exam' | 'prayer') => {
+    player.stop();
+    setLines([]);
+    const { LiveTeacher } = await import('./live/session');
+    teacher.current?.stop();
+    const t = new LiveTeacher(liveHost.current);
+    teacher.current = t;
+    const o = liveTestOverrides();
+    beginSession(intent === 'exam' ? 'exam' : intent === 'prayer' ? 'prayer' : 'recite');
+    setListening(true);
+    void keepAwake(true);
+    lastActivity.current = Date.now();
+    await t.start({ apiKey, voice: live.current.settings.liveVoice, greeting: greetingFor(intent), baseUrl: o.baseUrl, model: o.model });
+  };
+
+  /** Arrêt voulu par l'application : la fin de séance est gérée par stopListening. */
+  const localStop = useRef(false);
+  const stopLive = () => {
+    localStop.current = true;
+    teacher.current?.stop();
+    localStop.current = false;
+    teacher.current = null;
+    setLiveState('closed');
+  };
+
+  /** Texte imprimé d'une suite de versets, avec leurs numéros, pour le cheikh. */
+  const ayatText = (m: Mushaf, s: number, a1: number, a2: number) => {
+    const out: string[] = [];
+    for (let a = a1; a <= a2; a++) {
+      const ay = m.ayah(s, a);
+      if (!ay) break;
+      out.push(`${m.words.slice(ay.first, ay.first + ay.count).map((w) => plain(w.text)).join(' ')} (${a})`);
+    }
+    return out.join(' ');
+  };
+
+  const liveTools = async (name: string, args: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const m = live.current.mushaf;
+    const num = (k: string) => (typeof args[k] === 'number' ? (args[k] as number) : Number(args[k]) || undefined);
+    if (!m && name !== 'stop_recitation' && name !== 'end_session') return { error: 'المصحف لم يُحمَّل بعد' };
+    switch (name) {
+      case 'open_mushaf': {
+        const s = Math.min(114, Math.max(1, num('surah') ?? 1));
+        const meta = SURAHS[s - 1];
+        const a1 = Math.min(meta.ayahs, Math.max(1, num('from_ayah') ?? 1));
+        const a2 = Math.min(meta.ayahs, Math.max(a1, num('to_ayah') ?? meta.ayahs), a1 + 39);
+        pickRange({ kind: 'surah', s, a1, a2 }, true);
+        return {
+          riwaya: riwayaById(live.current.settings.riwaya).name,
+          surah: `سورة ${meta.name}`,
+          from_ayah: a1,
+          to_ayah: a2,
+          last_ayah_of_surah: meta.ayahs,
+          text: ayatText(m!, s, a1, a2),
+          note: s !== 1 && s !== 9 && a1 === 1 ? 'البسملة تُقرأ قبل السورة وليست من آياتها هنا.' : undefined,
+        };
+      }
+      case 'get_fath': {
+        const t = tracker.current;
+        if (!t || t.locating) return { error: 'لم يُعرف موضع الطالب بعد. اطلب منه أن يبدأ أو يذكر الموضع.' };
+        if (t.done) return { done: true, note: 'أتمّ الطالب المقطع.' };
+        const next = t.nextWords();
+        t.markFath(next);
+        slip(next[0].g, 'fath');
+        fathAt.current = t.pos;
+        pulse('hint');
+        rerender();
+        const w = m!.words[t.pos];
+        return { position: ayahLabel(w.s, w.a), words: next.map((x) => plain(x.text)).join(' ') };
+      }
+      case 'exam_question': {
+        const q = askQuestion(live.current.exam ?? undefined, true);
+        if (!q) return { error: 'لا يمكن إنشاء سؤال من هذا المقطع' };
+        const expected = q.expect ? m!.words.slice(q.expect[0], q.expect[1]).map((w) => plain(w.text)).join(' ') : undefined;
+        return {
+          question: q.prompt,
+          shown_to_student: plain(q.shown),
+          expected_answer: expected,
+          choices: q.options?.map((n) => `سورة ${SURAHS[n - 1].name}`),
+          correct_answer: q.answer ? `سورة ${SURAHS[q.answer - 1].name}` : undefined,
+          location: ayahLabel(q.ayah.s, q.ayah.a),
+        };
+      }
+      case 'exam_answer':
+        finishQuestion(!!args.correct, false, true);
+        return { ok: true };
+      case 'tafsir': {
+        const t = tracker.current;
+        let s = num('surah');
+        let a = num('ayah');
+        if (!s || !a) {
+          const g = t && !t.locating ? Math.max(t.start, Math.min(t.pos, t.end) - 1) : 0;
+          const ay = m!.ayahOfWord(g);
+          s = ay.s;
+          a = ay.a;
+        }
+        const tf = TAFASIR.find((x) => x.id === live.current.settings.tafsir) ?? TAFASIR[0];
+        const text = await loadTafsir(tf.edition, s, a);
+        return { source: tf.name, ayah: ayahLabel(s, a), text };
+      }
+      case 'play_recitation': {
+        const s = num('surah');
+        if (s) {
+          const meta = SURAHS[s - 1];
+          const a1 = num('from_ayah') ?? 1;
+          playRange(s, a1, Math.min(meta.ayahs, num('to_ayah') ?? Math.min(meta.ayahs, a1 + 29)));
+        } else playFromHere();
+        return { playing: true };
+      }
+      case 'stop_recitation':
+        player.stop();
+        return { stopped: true };
+      case 'set_riwaya': {
+        const r = RIWAYAT.find((x) => x.id === args.riwaya);
+        if (!r) return { error: 'رواية غير معروفة' };
+        update({ riwaya: r.id, reciter: '' });
+        live.current.settings = { ...live.current.settings, riwaya: r.id };
+        await loadMushaf(r);
+        return { ok: true, riwaya: r.name };
+      }
+      case 'prayer':
+        if (args.on) enterPrayer();
+        else leavePrayer();
+        return { ok: true };
+      case 'end_session':
+        window.setTimeout(() => stopListening(true), 2500);
+        return { ok: true };
+      default:
+        return { error: 'أداة غير معروفة' };
+    }
+  };
+
+  const onLiveUserTurn = (text: string) => {
+    const t = tracker.current;
+    const m = live.current.mushaf;
+    if (!t || !m) return;
+    const w = words(text);
+    if (!w.length) return;
+    if (live.current.prayer && w.join(' ').includes('الله اكبر') && w.length <= 3) {
+      t.setFree();
+      rerender();
+      return;
+    }
+    if (parseCommand(w, live.current.prayer) || live.current.exam?.q.kind === 'where') return;
+    if (live.current.exam?.phase === 'answered') return;
+    const before = t.stats.ok;
+    const ev = t.feed(w);
+    if (session.current) session.current.words += t.stats.ok - before;
+    for (const e of ev) {
+      // Le cheikh juge et parle lui-même ; l'application garde la trace et l'affichage.
+      if (e.type === 'mistake') slip(e.at, e.kind, e.heard);
+      if (e.type === 'ayah' && session.current) session.current.ayahs++;
+    }
+    rerender();
+  };
+
+  const liveHost = useRef<LiveHost>(null!);
+  liveHost.current = {
+    riwayaName: () => riwayaById(live.current.settings.riwaya).name,
+    callTool: (name, args) => liveTools(name, args),
+    micMuted: () => player.playing,
+    reciting: () => {
+      if (live.current.prayer) return true;
+      const t = tracker.current;
+      return !!t && !t.locating && !t.done && t.stats.ok > 0 && live.current.exam?.q.kind !== 'where';
+    },
+    idleLimitMs: () => (live.current.prayer ? 20 : 3) * 60_000,
+    onLine: (role, id, text, final) =>
+      setLines((prev) => {
+        const i = prev.findIndex((l) => l.role === role && l.id === id);
+        const next = i >= 0 ? prev.map((l, k) => (k === i ? { role, id, text, final } : l)) : [...prev, { role, id, text, final }];
+        return next.slice(-8);
+      }),
+    onUserTurn: onLiveUserTurn,
+    onState: (s, detail) => {
+      setLiveState(s);
+      if ((s === 'closed' || s === 'error') && !localStop.current) {
+        teacher.current = null;
+        setListening(false);
+        void keepAwake(false);
+        endSession(s === 'closed' && !detail);
+        if (live.current.prayer) {
+          setPrayer(false);
+          live.current.prayer = false;
+        }
+        if (detail) say(detail, s === 'error' ? 'err' : 'info', 8000);
+      }
+    },
+    onActivity: () => {
+      lastActivity.current = Date.now();
+    },
+  };
+
+  /* ---------- Écoute (les deux moteurs) ---------- */
+
   const startListening = (mode: SessionRecord['mode'] = 'recite') => {
+    player.stop();
     unlockAudio();
     lastActivity.current = Date.now();
+    if (live.current.liveMode) {
+      void startLive(mode === 'exam' ? 'exam' : mode === 'prayer' ? 'prayer' : 'recite');
+      return;
+    }
     beginSession(mode);
     if (!typing) recognizer.start();
     else setListening(true);
@@ -206,6 +452,7 @@ export default function App() {
   };
 
   const stopListening = (show = true) => {
+    if (teacher.current) stopLive();
     recognizer.stop();
     setListening(false);
     setInterim('');
@@ -259,26 +506,33 @@ export default function App() {
     slip(next[0].g, 'fath');
     fathAt.current = t.pos;
     lastActivity.current = Date.now();
-    sayFath(next.map((w) => w.text).join(' '), live.current.settings.voice);
+    const text = next.map((w) => plain(w.text)).join(' ');
+    if (liveActive()) {
+      // Le cheikh souffle lui-même les mots exacts que l'application lui donne.
+      teacher.current!.note(`توقف الطالب. افتح عليه بهذه الكلمات فقط، همساً، ثم اسكت: «${text}»`);
+    } else sayFath(text, live.current.settings.voice);
     pulse('hint');
     rerender();
+  };
+
+  const playRange = (s: number, a1: number, a2: number) => {
+    const { reciters, sameRiwaya } = recitersFor(riwayaById(live.current.settings.riwaya));
+    const reciter = reciters.find((r) => r.id === live.current.settings.reciter) ?? reciters[0];
+    const list: AyahRef[] = [];
+    for (let a = a1; a <= a2 && list.length < 40; a++) list.push({ s, a });
+    player.play(reciter, list);
+    say(`${reciter.name}${sameRiwaya ? '' : ' (برواية حفص)'}`, 'info', 3000);
   };
 
   const playFromHere = () => {
     const t = tracker.current;
     const m = live.current.mushaf;
     if (!t || !m) return;
-    const { reciters, sameRiwaya } = recitersFor(riwaya);
-    const reciter = reciters.find((r) => r.id === settings.reciter) ?? reciters[0];
     const startAyah = t.locating ? m.ayahOfWord(t.start) : m.ayahOfWord(Math.min(t.pos, t.end - 1));
-    const list: AyahRef[] = [];
-    for (let i = m.ayahs.indexOf(startAyah); i < m.ayahs.length && list.length < 30; i++) {
-      const a = m.ayahs[i];
-      if (a.first >= t.end) break;
-      list.push({ s: a.s, a: a.a });
-    }
-    player.play(reciter, list);
-    say(`${reciter.name}${sameRiwaya ? '' : ' (برواية حفص)'}`, 'info', 3000);
+    const meta = SURAHS[startAyah.s - 1];
+    const endAyah = m.ayahOfWord(Math.min(t.end, m.words.length) - 1);
+    const last = endAyah.s === startAyah.s ? endAyah.a : meta.ayahs;
+    playRange(startAyah.s, startAyah.a, Math.min(last, startAyah.a + 29));
   };
 
   const showTafsir = () => {
@@ -297,35 +551,54 @@ export default function App() {
 
   /* ---------- Prière ---------- */
 
-  const startPrayer = () => {
+  /** Passe en prière sans couper l'écoute (le cheikh en direct reste connecté). */
+  const enterPrayer = () => {
     const m = live.current.mushaf;
     if (!m) return;
-    stopListening(false);
+    player.stop();
     exitExam(false);
     const t = new Tracker(m, { strictness: live.current.settings.strictness });
     t.setFree();
     tracker.current = t;
     setPrayer(true);
     live.current.prayer = true;
+    if (session.current) session.current.mode = 'prayer';
+    rerender();
+  };
+
+  const leavePrayer = () => {
+    setPrayer(false);
+    live.current.prayer = false;
+    if (live.current.mushaf) resetTracker(live.current.mushaf, live.current.settings.range);
+  };
+
+  const startPrayer = () => {
+    if (!live.current.mushaf) return;
+    if (liveActive()) {
+      enterPrayer();
+      teacher.current!.note('بدأ الطالب الصلاة. اسكت تماماً إلا «أعِد» عند الخطأ والفتح عند التوقف.', false);
+      return;
+    }
+    stopListening(false);
+    enterPrayer();
     startListening('prayer');
     say('تقبّل الله. اقرأ، وسأتبعك', 'info', 3000);
   };
 
   const endPrayer = () => {
-    setPrayer(false);
-    live.current.prayer = false;
+    leavePrayer();
     stopListening(true);
-    if (live.current.mushaf) resetTracker(live.current.mushaf, live.current.settings.range);
   };
 
   /* ---------- Examen ---------- */
 
-  const askQuestion = (prev?: ExamState) => {
+  const askQuestion = (prev?: ExamState, silent = false): Question | null => {
     const m = live.current.mushaf;
-    if (!m) return;
+    if (!m) return null;
+    player.stop();
     const [start, end] = rangeBounds(m, live.current.settings.range);
     const q = makeQuestion(m, start, end, prev?.q.kind);
-    if (!q) return;
+    if (!q) return null;
     if (q.expect) {
       const t = new Tracker(m, { strictness: live.current.settings.strictness });
       t.setRange(...q.expect);
@@ -335,20 +608,31 @@ export default function App() {
     const st: ExamState = { q, asked: (prev?.asked ?? 0) + 1, right: prev?.right ?? 0, phase: 'asking' };
     setExam(st);
     live.current.exam = st;
-    sayText(q.prompt, live.current.settings.voice);
+    if (!silent) sayText(q.prompt, live.current.settings.voice);
     lastActivity.current = Date.now();
     rerender();
+    return q;
   };
 
   const startExam = () => {
     if (!live.current.mushaf) return;
-    stopListening(false);
+    player.stop();
     setStatus(null);
+    if (liveActive()) {
+      teacher.current!.note('الطالب يريد اختباراً: استدعِ exam_question واطرح السؤال.');
+      return;
+    }
+    stopListening(false);
+    if (live.current.liveMode) {
+      startListening('exam');
+      return;
+    }
     askQuestion();
     startListening('exam');
   };
 
-  const finishQuestion = (correctOverride?: boolean, gaveUp = false) => {
+  /** Fin d'une question. `fromTeacher` : le cheikh en direct a jugé et parle lui-même. */
+  const finishQuestion = (correctOverride?: boolean, gaveUp = false, fromTeacher = false) => {
     const st = live.current.exam;
     if (!st || st.phase !== 'asking') return;
     const t = tracker.current!;
@@ -357,14 +641,23 @@ export default function App() {
     setExam(next);
     live.current.exam = next;
     if (session.current) session.current.exam = { asked: next.asked, right: next.right };
+    pulse(correct ? 'ok' : 'repeat');
+    if (fromTeacher) return;
     if (correct) {
       chime('done');
-      pulse('ok');
       say('أحسنت', 'ok', 2500);
     } else {
-      pulse('repeat');
       say(gaveUp ? 'هذا هو الجواب' : t.stats.faths ? 'صحيحة بعد الفتح' : 'فيها خطأ', 'warn', 2500);
     }
+    if (liveActive()) {
+      const ans = st.q.answer ? `، والجواب الصحيح سورة ${SURAHS[st.q.answer - 1].name}` : '';
+      teacher.current!.note(gaveUp ? `الطالب لا يدري${ans}. بيّن له الجواب باختصار.` : `أجاب الطالب بالضغط على الشاشة، وجوابه ${correct ? 'صحيح' : 'خطأ'}${ans}. علّق بكلمة.`);
+    }
+  };
+
+  const nextQuestion = () => {
+    if (liveActive()) teacher.current!.note('الطالب يريد السؤال التالي: استدعِ exam_question.');
+    else askQuestion(live.current.exam ?? undefined);
   };
 
   const exitExam = (restore = true) => {
@@ -372,24 +665,30 @@ export default function App() {
     setExam(null);
     live.current.exam = null;
     if (restore) {
-      stopListening(false);
+      if (liveActive()) teacher.current!.note('أنهى الطالب الاختبار. اسكت واستمع.', false);
+      else stopListening(false);
       if (live.current.mushaf) resetTracker(live.current.mushaf, live.current.settings.range);
     }
   };
 
   /* ---------- Commandes ---------- */
 
-  const pickRange = (r: RangeChoice) => {
+  const pickRange = (r: RangeChoice, fromTeacher = false) => {
     update({ range: r });
     live.current.settings = { ...live.current.settings, range: r };
     exitExam(false);
+    if (!live.current.prayer) player.stop();
     if (session.current) {
       // Une séance en cours continue sur la nouvelle plage.
+      const mode = session.current.mode;
       endSession(false);
-      beginSession('recite');
+      beginSession(mode === 'prayer' ? 'prayer' : 'recite');
     }
     if (live.current.mushaf) resetTracker(live.current.mushaf, r);
     setSheet(null);
+    if (!fromTeacher && liveActive() && r.kind === 'surah') {
+      teacher.current!.note(`اختار الطالب من الشاشة: سورة ${r.s} من الآية ${r.a1} إلى ${r.a2}. استدعِ open_mushaf لها ثم قل «تفضّل».`);
+    }
   };
 
   const runCommand = (c: Command) => {
@@ -417,7 +716,7 @@ export default function App() {
     }
   };
 
-  /* ---------- Ce que l'on entend ---------- */
+  /* ---------- Ce que l'on entend (mode sans clé) ---------- */
 
   handlers.current.final = (text: string) => {
     lastActivity.current = Date.now();
@@ -474,6 +773,7 @@ export default function App() {
     const id = window.setInterval(() => {
       const t = tracker.current;
       if (!t || t.locating || t.done || player.playing || speakingNow()) return;
+      if (teacher.current && (teacher.current.speaking || teacher.current.state !== 'listening')) return;
       if (live.current.exam?.phase === 'answered' || live.current.exam?.q.kind === 'where') return;
       const delay = (live.current.prayer ? 3.5 : live.current.settings.fathDelay) * 1000;
       if (Date.now() - lastActivity.current < delay) return;
@@ -490,7 +790,15 @@ export default function App() {
     player.onAyah = (ref) => setPlaying(ref);
   }, [player]);
 
+  // La récitation enregistrée s'arrête quand on quitte l'application ou change de mode.
+  useEffect(() => () => player.stop(), [player]);
+
   /* ---------- Rendu ---------- */
+
+  const dialogueRef = useRef<HTMLOListElement>(null);
+  useEffect(() => {
+    dialogueRef.current?.lastElementChild?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+  }, [lines]);
 
   const t = tracker.current;
   const previewPos = t && interim ? t.preview(words(interim)) : (t?.pos ?? 0);
@@ -515,6 +823,10 @@ export default function App() {
   };
 
   const idle = !listening && t && !t.locating && t.pos === t.start && !exam;
+  const liveLines = liveMode ? lines.filter((l) => l.text) : [];
+  const statusText = playing
+    ? `▶ ${ayahLabel(playing.s, playing.a)}`
+    : (status?.text ?? (liveMode && listening ? LIVE_LABEL[liveState] : listening ? (interim ? '…' : 'أستمع') : ''));
 
   return (
     <div className={'app' + (prayer ? ' prayer' : '')}>
@@ -523,7 +835,7 @@ export default function App() {
           تَسْمِيع
         </button>
         <button className="riwaya-badge" onClick={() => setSheet('riwaya')} disabled={listening}>
-          <span className="dot-mini" aria-hidden />
+          <span className={'dot-mini' + (liveMode ? ' live' : '')} aria-hidden />
           {riwaya.short}
         </button>
       </header>
@@ -538,6 +850,16 @@ export default function App() {
           </div>
         )}
         {!mushaf && !loadError && <p className="loading">جارٍ تحميل مصحف {riwaya.name}…</p>}
+
+        {liveLines.length > 0 && (
+          <ol className={'dialogue ' + fontClass} aria-live="polite" ref={dialogueRef}>
+            {liveLines.slice(exam ? -3 : -8).map((l) => (
+              <li key={l.role + l.id} className={l.role + (l.final ? '' : ' partial')}>
+                <DialogueLine text={l.text} mushaf={mushaf} hint={t?.pos} />
+              </li>
+            ))}
+          </ol>
+        )}
 
         {mushaf && t && exam && (
           <section className="exam card">
@@ -582,7 +904,7 @@ export default function App() {
                   </button>
                 </>
               ) : (
-                <button className="primary" onClick={() => askQuestion(exam)}>
+                <button className="primary" onClick={nextQuestion}>
                   السؤال التالي
                 </button>
               )}
@@ -600,26 +922,36 @@ export default function App() {
                 <button className="range-pill" onClick={() => setSheet('range')}>
                   {rangeLabel(settings.range)} <span aria-hidden>▾</span>
                 </button>
-                <p className="hint">اضغط الدائرة ثم اقرأ من حفظك. يسكت ما دمتَ مصيباً، ويقول «أعِد» عند الخطأ، ويفتح عليك إذا نسيت.</p>
+                <p className="hint">
+                  {liveMode
+                    ? 'اضغط الدائرة وكلّم الشيخ: قل ما ستقرأ ثم اقرأ، أو «اختبرني»، أو اسأله عن معنى آية.'
+                    : 'اضغط الدائرة ثم اقرأ من حفظك. يسكت ما دمتَ مصيباً، ويقول «أعِد» عند الخطأ، ويفتح عليك إذا نسيت.'}
+                </p>
+                {!apiKey && (
+                  <button className="key-cta" onClick={() => setSheet('settings')}>
+                    أدخل مفتاح Gemini المجاني ليحادثك الشيخ بصوته
+                  </button>
+                )}
               </div>
-            ) : t.locating ? (
+            ) : liveMode && listening ? null : t.locating ? (
               <div className="intro">
-                <p className="hint big">{prayer ? 'اقرأ، وسأتبعك' : 'اقرأ من أي موضع، وسأجد مكانك'}</p>
+                <p className="hint big">{prayer ? 'اقرأ، وسأتبعك' : liveMode ? 'قل ما ستقرأ، أو ابدأ القراءة' : 'اقرأ من أي موضع، وسأجد مكانك'}</p>
               </div>
             ) : (
               <RecitationView mushaf={mushaf} tracker={t} previewPos={previewPos} showText={settings.showText} fontClass={fontClass} />
             )}
           </>
         )}
+
       </main>
 
       <div className={'status ' + (status?.tone ?? '')} role="status">
-        {playing ? `▶ ${ayahLabel(playing.s, playing.a)}` : (status?.text ?? (listening ? (interim ? '…' : 'أستمع') : ''))}
+        {statusText}
       </div>
 
       <div className="dock">
         <button
-          className={'ink' + (listening ? ' live' : '') + (flash ? ' flash-' + flash : '')}
+          className={'ink' + (listening ? ' live' : '') + (liveMode && liveState === 'speaking' ? ' speaking' : '') + (flash ? ' flash-' + flash : '')}
           onClick={toggleDot}
           disabled={!mushaf}
           aria-pressed={listening}
@@ -662,9 +994,13 @@ export default function App() {
           <button onClick={playing ? () => player.stop() : playFromHere} disabled={!mushaf}>
             {playing ? 'حسبك' : 'أسمعني'}
           </button>
-          <button onClick={showTafsir} disabled={!mushaf}>
-            المعنى
-          </button>
+          {liveMode && liveState === 'speaking' ? (
+            <button onClick={() => teacher.current?.hush()}>اسكت</button>
+          ) : (
+            <button onClick={showTafsir} disabled={!mushaf}>
+              المعنى
+            </button>
+          )}
           <button onClick={startPrayer} disabled={!mushaf}>
             الصلاة
           </button>
@@ -678,7 +1014,13 @@ export default function App() {
       {prayer && (
         <div className="prayer-veil" onDoubleClick={endPrayer}>
           <div className={'prayer-dot' + (flash ? ' flash-' + flash : '')} />
-          <p>{t?.locating ? 'أستمع' : t && mushaf ? ayahLabel(mushaf.words[Math.min(t.pos, mushaf.words.length - 1)].s, mushaf.words[Math.min(t.pos, mushaf.words.length - 1)].a) : ''}</p>
+          <p>
+            {t?.locating
+              ? 'أستمع'
+              : t && mushaf
+                ? ayahLabel(mushaf.words[Math.min(t.pos, mushaf.words.length - 1)].s, mushaf.words[Math.min(t.pos, mushaf.words.length - 1)].a)
+                : ''}
+          </p>
           <button className="ghost" onClick={endPrayer}>
             إنهاء الصلاة
           </button>
@@ -689,13 +1031,14 @@ export default function App() {
         <RiwayaSheet
           current={settings.riwaya}
           onPick={(id) => {
+            player.stop();
             update({ riwaya: id, reciter: '' });
             setSheet(null);
           }}
           onClose={() => setSheet(null)}
         />
       )}
-      {sheet === 'range' && <RangeSheet current={settings.range} onPick={pickRange} onClose={() => setSheet(null)} />}
+      {sheet === 'range' && <RangeSheet current={settings.range} onPick={(r) => pickRange(r)} onClose={() => setSheet(null)} />}
       {sheet === 'settings' && (
         <SettingsSheet
           settings={settings}
@@ -704,6 +1047,13 @@ export default function App() {
           setTyping={(v) => {
             if (listening) stopListening(false);
             setTyping(v);
+          }}
+          apiKey={apiKey}
+          setApiKey={(k) => {
+            if (listening) stopListening(false);
+            saveKey(k);
+            setApiKey(k);
+            if (k) update({ engine: 'live' });
           }}
           onClose={() => setSheet(null)}
         />
@@ -753,4 +1103,3 @@ export default function App() {
     </div>
   );
 }
-

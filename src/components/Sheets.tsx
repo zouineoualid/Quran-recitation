@@ -5,6 +5,7 @@ import { SURAHS } from '../data/surahs';
 import { normalize } from '../quran/arabic';
 import { arNum, ayahLabel } from '../exam/exam';
 import { clearHistory, loadHistory, weakSpots, type RangeChoice, type Settings } from '../store';
+import { VOICES } from '../live/voices';
 
 type Close = { onClose: () => void };
 
@@ -133,17 +134,128 @@ export function RangeSheet({ current, onPick, onClose }: Close & { current: Rang
   );
 }
 
+function KeySection({ apiKey, setApiKey }: { apiKey: string; setApiKey: (k: string) => void }) {
+  const [draft, setDraft] = useState('');
+  const [error, setError] = useState('');
+  const save = () => {
+    const k = draft.trim();
+    if (!/^[A-Za-z0-9_-]{30,}$/.test(k)) {
+      setError('هذا لا يشبه مفتاح Gemini. انسخه كاملاً من Google AI Studio.');
+      return;
+    }
+    setError('');
+    setApiKey(k);
+    setDraft('');
+  };
+  if (apiKey)
+    return (
+      <div className="key-saved">
+        <span>
+          المفتاح محفوظ على هذا الجهاز: <bdi>…{apiKey.slice(-4)}</bdi>
+        </span>
+        <button className="ghost danger" onClick={() => setApiKey('')}>
+          حذف المفتاح
+        </button>
+      </div>
+    );
+  return (
+    <div className="key-form">
+      <ol className="guide small">
+        <li>
+          افتح{' '}
+          <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer">
+            صفحة المفاتيح في Google AI Studio
+          </a>{' '}
+          وادخل بحساب Google.
+        </li>
+        <li>اضغط «Create API key» ثم انسخ المفتاح. المفتاح مجاني.</li>
+        <li>الصقه هنا واحفظه.</li>
+      </ol>
+      <div className="key-field">
+        <input
+          className="field mono"
+          type="password"
+          autoComplete="off"
+          spellCheck={false}
+          dir="ltr"
+          placeholder="AIza…"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+        />
+        <button
+          className="ghost"
+          onClick={async () => {
+            try {
+              setDraft((await navigator.clipboard.readText()).trim());
+            } catch {
+              setError('تعذّر اللصق تلقائياً، الصق المفتاح يدوياً.');
+            }
+          }}
+        >
+          لصق
+        </button>
+      </div>
+      {error && <p className="key-error">{error}</p>}
+      <button className="primary" onClick={save} disabled={!draft.trim()}>
+        حفظ
+      </button>
+    </div>
+  );
+}
+
 export function SettingsSheet({
   settings,
   update,
   typing,
   setTyping,
+  apiKey,
+  setApiKey,
   onClose,
-}: Close & { settings: Settings; update: (p: Partial<Settings>) => void; typing: boolean; setTyping: (v: boolean) => void }) {
+}: Close & {
+  settings: Settings;
+  update: (p: Partial<Settings>) => void;
+  typing: boolean;
+  setTyping: (v: boolean) => void;
+  apiKey: string;
+  setApiKey: (k: string) => void;
+}) {
   const riwaya = riwayaById(settings.riwaya);
   const { reciters, sameRiwaya } = recitersFor(riwaya);
   return (
     <Sheet title="الإعدادات" onClose={onClose}>
+      <section className="live-box">
+        <h3>الشيخ الحي (Gemini Live)</h3>
+        <p className="muted">
+          بمفتاحك يصبح الشيخ محاوراً بصوته: يسمعك ويكلّمك ويختبرك ويجيب عن أسئلتك، ويحكم بنص المصحف الذي يعطيه إياه التطبيق.
+        </p>
+        <KeySection apiKey={apiKey} setApiKey={setApiKey} />
+        {apiKey && (
+          <>
+            <div className="seg small">
+              <button className={settings.engine === 'live' ? 'on' : ''} onClick={() => update({ engine: 'live' })}>
+                الشيخ الحي
+              </button>
+              <button className={settings.engine === 'local' ? 'on' : ''} onClick={() => update({ engine: 'local' })}>
+                بلا مفتاح (التعرف المحلي)
+              </button>
+            </div>
+            <label className="setting">
+              <span>صوت الشيخ</span>
+              <select className="field" value={settings.liveVoice} onChange={(e) => update({ liveVoice: e.target.value })}>
+                {VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </>
+        )}
+        <small className="muted caveat">
+          يبقى المفتاح في متصفحك ولا يُرسَل إلا إلى Google. في الخطة المجانية قد يطّلع مراجعون من Google على ما يصلها (صوتك ونصّه)
+          لتحسين منتجاتها، ويشترط Google أن يكون صاحب المفتاح قد بلغ ١٨ سنة.
+        </small>
+      </section>
       <div className="setting">
         <span>النص أثناء القراءة</span>
         <div className="seg small">
@@ -319,9 +431,15 @@ export function HelpSheet({ onClose }: Close) {
           <b>الله أكبر</b> وضع الصلاة (شاشة مظلمة، فتح بعد ٣٫٥ ثوانٍ)، و<b>السلام عليكم</b> لإنهائه
         </li>
       </ul>
+      <h3>الشيخ الحي</h3>
+      <p>
+        إذا أدخلت مفتاح Gemini (مجاني) في الإعدادات صار الشيخ يحاورك بصوته: تقول له ما ستقرأ، فيأخذ نص المصحف من التطبيق ويسمعك،
+        ويسكت ما دمت مصيباً، ويقول «أعِد» عند الخطأ، ويفتح عليك بالكلمات المطبوعة، ويختبرك ويجيب عن أسئلتك. ما تقرؤه وما يقرؤه من
+        القرآن يُعرض بخط المصحف كما هو في روايتك.
+      </p>
       <h3>ملاحظات</h3>
       <p className="muted">
-        يعتمد التسميع على خدمة التعرف على الكلام في المتصفح (Chrome أو Edge أو Safari). في Chrome يُرسَل الصوت إلى خوادم Google
+        بلا مفتاح، يعتمد التسميع على خدمة التعرف على الكلام في المتصفح (Chrome أو Edge أو Safari). في Chrome يُرسَل الصوت إلى خوادم Google
         لتحويله إلى نص، ولا يحفظه التطبيق. السجل والإعدادات تبقى على جهازك. التعرف على الكلام يميل إلى رواية حفص، لذا يقبل التطبيق
         لفظ حفص في مواضع الفرش، ولا يحكم على الأصول (الإمالة، التسهيل…).
       </p>

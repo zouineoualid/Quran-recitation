@@ -765,3 +765,113 @@ button:disabled {
     animation: none;
   }
 }
+
+/* ---------- Cheikh en direct ---------- */
+
+.dot-mini.live {
+  background: var(--sage);
+  box-shadow: 0 0 0 3px rgb(143 197 154 / 0.25);
+}
+
+.ink.speaking {
+  background: radial-gradient(circle at 40% 35%, #cfe9d4 0%, var(--sage) 55%, #4f8259 100%);
+}
+
+.dialogue {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 18px;
+  padding-inline-start: 2px;
+  align-self: stretch;
+}
+.dialogue li {
+  padding-inline-start: 12px;
+  font-size: 1.05rem;
+  line-height: 1.9;
+  color: var(--parchment-dim);
+}
+.dialogue li.model {
+  border-inline-start: 2px solid color-mix(in srgb, var(--sage) 60%, transparent);
+  color: var(--sage);
+  font-weight: 700;
+}
+.dialogue li.partial {
+  opacity: 0.7;
+}
+
+.key-cta {
+  min-height: 44px;
+  padding-inline: 18px;
+  border-radius: 999px;
+  border: 1px dashed color-mix(in srgb, var(--sage) 60%, transparent);
+  color: var(--sage);
+  font-weight: 700;
+}
+
+.live-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid color-mix(in srgb, var(--sage) 35%, var(--rule));
+  background: rgb(143 197 154 / 0.05);
+}
+.live-box h3 {
+  color: var(--sage);
+  margin: 0;
+}
+.live-box a {
+  color: var(--gold);
+}
+.key-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.key-field {
+  display: flex;
+  gap: 8px;
+}
+.key-field .field {
+  flex: 1;
+  min-width: 0;
+}
+.field.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-align: left;
+}
+.key-saved {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.key-saved bdi {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--parchment);
+}
+.key-error {
+  color: #f2b8a8;
+}
+.guide.small {
+  font-size: 0.95rem;
+}
+.caveat {
+  line-height: 1.8;
+}
+
+/* Passages du Coran dans la conversation : tels qu'imprimés dans le mushaf. */
+.dialogue .q {
+  font-family: var(--quran);
+  font-size: 1.32em;
+  font-weight: 400;
+  line-height: 2.1;
+  color: var(--parchment);
+}
+.dialogue .q .ayah-no {
+  font-size: 0.8em;
+}

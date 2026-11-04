@@ -19,6 +19,10 @@ export interface Settings {
   voice: boolean;
   tafsir: string;
   range: RangeChoice;
+  /** « live » : le cheikh en direct (Gemini Live, avec une clé) ; « local » : sans clé. */
+  engine: 'live' | 'local';
+  /** Voix du cheikh en direct. */
+  liveVoice: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -30,6 +34,8 @@ export const DEFAULT_SETTINGS: Settings = {
   voice: true,
   tafsir: 'muyassar',
   range: { kind: 'surah', s: 67, a1: 1, a2: 30 },
+  engine: 'live',
+  liveVoice: 'Charon',
 };
 
 function read<T>(key: string, fallback: T): T {
@@ -114,4 +120,36 @@ export function weakSpots(history: SessionRecord[], riwaya: string, limit = 12) 
     }
   }
   return [...count.values()].sort((x, y) => y.n - x.n || y.last - x.last).slice(0, limit);
+}
+
+/* La clé Gemini reste dans ce navigateur ; elle n'est envoyée qu'à Google. */
+const KEY = 'tasmee.geminiKey';
+
+export function loadKey(): string {
+  try {
+    return localStorage.getItem(KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+export function saveKey(key: string) {
+  try {
+    if (key) localStorage.setItem(KEY, key);
+    else localStorage.removeItem(KEY);
+  } catch {
+    /* stockage interdit */
+  }
+}
+
+/** Réglages de test (serveur Live simulé), lus seulement s'ils existent. */
+export function liveTestOverrides(): { baseUrl?: string; model?: string } {
+  try {
+    return {
+      baseUrl: localStorage.getItem('tasmee.liveBaseUrl') ?? undefined,
+      model: localStorage.getItem('tasmee.liveModel') ?? undefined,
+    };
+  } catch {
+    return {};
+  }
 }

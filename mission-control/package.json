@@ -1,0 +1,14 @@
+{
+  "name": "mission-control",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dashboard local pour piloter une équipe d'agents Claude Code (Command Center, Agents, Board, Pipeline, Deals, Skills, Analytics, Logs, Memory, Settings).",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "mc": "node scripts/mc.js",
+    "test": "node --test"
+  }
+}

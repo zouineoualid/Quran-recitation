@@ -417,3 +417,17 @@ code.inline { font: 12px var(--mono); background: var(--surface-2); border: 1px 
   .main { padding: 20px 16px 48px; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ---------- agents de l'utilisateur ---------- */
+.node-root { background: var(--surface); border: 1.5px dashed var(--baseline); cursor: default; }
+.node-root:hover { transform: none; box-shadow: none; }
+.node-orange { background: var(--t-orange); border-color: color-mix(in srgb, var(--t-orange-ink) 22%, transparent); }
+.node-yellow { background: var(--t-yellow); border-color: color-mix(in srgb, var(--t-yellow-ink) 22%, transparent); }
+.node.running { outline: 2px solid var(--series-1); outline-offset: 1px; }
+.node-name { min-width: 0; }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+@keyframes pulse-dot { 50% { opacity: .35; } }
+.chip input[type=checkbox] { margin: 0 4px 0 0; vertical-align: -1px; }
+.field input[type=checkbox] { width: auto; padding: 0; }
+.brand-name { line-height: 1.25; }

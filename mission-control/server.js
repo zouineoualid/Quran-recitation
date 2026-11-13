@@ -1,27 +1,33 @@
 // Mission Control — serveur local sans dépendance.
 // - Sert le dashboard (public/)
 // - Expose une API JSON sur data/state.json
-// - Lit les agents (.claude/agents/*.md) et les skills (.claude/skills/*/SKILL.md)
-// - Pousse les changements en direct (Server-Sent Events) : quand un agent Claude Code
-//   modifie data/state.json ou un fichier .claude/, le dashboard se met à jour tout seul.
+// - Découvre TES agents et skills Claude Code :
+//     ~/.claude/agents, ~/.claude/skills                (agents globaux)
+//     <projet>/.claude/agents, <projet>/.claude/skills  (chaque projet connu de Claude Code
+//                                                        dans ~/.claude.json + ceux ajoutés dans Settings)
+// - Pousse les changements en direct (Server-Sent Events).
 
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSeed } from './seed.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(ROOT, 'public');
-const DATA_DIR = path.join(ROOT, 'data');
+const DATA_DIR = process.env.MC_DATA_DIR || path.join(ROOT, 'data');
 const STATE_FILE = path.join(DATA_DIR, 'state.json');
-const AGENTS_DIR = path.join(ROOT, '.claude', 'agents');
-const SKILLS_DIR = path.join(ROOT, '.claude', 'skills');
+const CLAUDE_HOME = process.env.MC_CLAUDE_HOME || path.join(os.homedir(), '.claude');
+const CLAUDE_JSON = process.env.MC_CLAUDE_JSON || path.join(os.homedir(), '.claude.json');
+const HOOK_SCRIPT = path.join(ROOT, 'scripts', 'hook.js');
 const PORT = Number(process.env.PORT) || 3000;
 const HOST = process.env.HOST || '127.0.0.1';
+const ACTIVE_WINDOW_MS = 24 * 3600 * 1000;
 
 const COLLECTIONS = new Set(['tasks', 'pipeline', 'deals', 'logs', 'memory']);
 const PREFIX = { tasks: 'task', pipeline: 'cnt', deals: 'deal', logs: 'log', memory: 'mem' };
+const MAX_LOGS = 5000;
 
 // ---------- état ----------
 export function readState() {
@@ -29,7 +35,6 @@ export function readState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch (err) {
-    // Fichier en cours d'écriture par un agent, ou JSON invalide : on ne casse rien.
     console.error('state.json illisible :', err.message);
     return null;
   }
@@ -37,7 +42,8 @@ export function readState() {
 
 export function writeState(state) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  const tmp = `${STATE_FILE}.${process.pid}.tmp`;
+  if (state.logs?.length > MAX_LOGS) state.logs = state.logs.slice(-MAX_LOGS);
+  const tmp = `${STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
@@ -46,7 +52,7 @@ const newId = (p) => `${p}_${Date.now().toString(36)}${Math.random().toString(36
 
 // ---------- frontmatter (sous-ensemble YAML suffisant pour les agents) ----------
 export function parseFrontmatter(text) {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
+  const m = /^﻿?---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
   if (!m) return { meta: {}, body: text };
   const meta = {};
   let listKey = null;
@@ -66,49 +72,106 @@ export function parseFrontmatter(text) {
   return { meta, body: m[2] };
 }
 const unquote = (s) => s.replace(/^["'](.*)["']$/, '$1');
+const toList = (v) => (Array.isArray(v) ? v : v ? String(v).split(',').map((s) => s.trim()).filter(Boolean) : []);
 
-function readAgents(state) {
-  if (!fs.existsSync(AGENTS_DIR)) return [];
-  return fs.readdirSync(AGENTS_DIR)
-    .filter((f) => f.endsWith('.md'))
-    .map((f) => {
-      const { meta, body } = parseFrontmatter(fs.readFileSync(path.join(AGENTS_DIR, f), 'utf8'));
+// ---------- découverte des sources (global + projets) ----------
+function knownProjects() {
+  try {
+    const json = JSON.parse(fs.readFileSync(CLAUDE_JSON, 'utf8'));
+    return Object.keys(json.projects || {});
+  } catch { return []; }
+}
+
+export function discoverSources(state) {
+  const sources = [{ id: 'global', label: 'Global', kind: 'user', root: path.dirname(CLAUDE_HOME), claudeDir: CLAUDE_HOME, auto: true }];
+  const manual = toList(state?.settings?.projects);
+  const seen = new Set([path.resolve(CLAUDE_HOME)]);
+  for (const [p, auto] of [...knownProjects().map((p) => [p, true]), ...manual.map((p) => [p, false])]) {
+    const root = path.resolve(p);
+    const claudeDir = path.join(root, '.claude');
+    if (seen.has(claudeDir)) continue;
+    seen.add(claudeDir);
+    const has = fs.existsSync(path.join(claudeDir, 'agents')) || fs.existsSync(path.join(claudeDir, 'skills'));
+    if (!has && auto) continue; // projets auto-détectés sans agents : on les ignore
+    sources.push({ id: root, label: path.basename(root) || root, kind: 'project', root, claudeDir, auto, missing: !has });
+  }
+  return sources;
+}
+
+function agentStatus(st) {
+  if (st.status === 'offline') return 'offline';
+  if (st.lastSeen && Date.now() - new Date(st.lastSeen) < ACTIVE_WINDOW_MS) return 'online';
+  return 'idle';
+}
+
+function readAgents(state, sources) {
+  const out = [];
+  for (const src of sources) {
+    const dir = path.join(src.claudeDir, 'agents');
+    if (!fs.existsSync(dir)) continue;
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith('.md')); } catch { continue; }
+    for (const f of files) {
+      let text;
+      try { text = fs.readFileSync(path.join(dir, f), 'utf8'); } catch { continue; }
+      const { meta, body } = parseFrontmatter(text);
       const name = meta.name || f.replace(/\.md$/, '');
       const st = state?.agentStatus?.[name] || {};
-      return {
+      out.push({
+        id: `${src.id}::${name}`,
         name,
         label: meta.label || name,
         description: meta.description || '',
         model: meta.model || 'inherit',
-        tools: Array.isArray(meta.tools) ? meta.tools : (meta.tools ? String(meta.tools).split(',').map((s) => s.trim()) : []),
-        connects: Array.isArray(meta.connects) ? meta.connects : [],
+        tools: toList(meta.tools),
+        connects: toList(meta.connects),
         icon: meta.icon || 'bot',
-        file: `.claude/agents/${f}`,
+        color: meta.color || '',
+        source: src.label,
+        sourceKind: src.kind,
+        file: path.join(dir, f),
         prompt: body.trim(),
-        status: st.status || 'offline',
+        status: agentStatus(st),
+        running: !!st.running,
         lastSeen: st.lastSeen || null,
         currentTask: st.currentTask || '',
-      };
-    })
-    .sort((a, b) => (a.name === 'orchestrator' ? -1 : b.name === 'orchestrator' ? 1 : a.name.localeCompare(b.name)));
+        runs: st.runs || 0,
+      });
+    }
+  }
+  return out.sort((a, b) => (a.sourceKind === b.sourceKind ? a.source.localeCompare(b.source) || a.name.localeCompare(b.name) : a.sourceKind === 'user' ? -1 : 1));
 }
 
-function readSkills() {
-  if (!fs.existsSync(SKILLS_DIR)) return [];
-  return fs.readdirSync(SKILLS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && fs.existsSync(path.join(SKILLS_DIR, d.name, 'SKILL.md')))
-    .map((d) => {
-      const file = path.join(SKILLS_DIR, d.name, 'SKILL.md');
+function readSkills(sources) {
+  const out = [];
+  for (const src of sources) {
+    const dir = path.join(src.claudeDir, 'skills');
+    if (!fs.existsSync(dir)) continue;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const d of entries) {
+      const file = path.join(dir, d.name, 'SKILL.md');
+      if (!d.isDirectory() || !fs.existsSync(file)) continue;
       const { meta, body } = parseFrontmatter(fs.readFileSync(file, 'utf8'));
-      return {
+      out.push({
         name: meta.name || d.name,
         description: meta.description || '',
-        agents: Array.isArray(meta.agents) ? meta.agents : [],
-        file: `.claude/skills/${d.name}/SKILL.md`,
+        agents: toList(meta.agents),
+        source: src.label,
+        file,
         body: body.trim(),
         updatedAt: fs.statSync(file).mtime.toISOString(),
-      };
-    });
+      });
+    }
+  }
+  return out;
+}
+
+export function hooksInstalled() {
+  try {
+    const s = JSON.parse(fs.readFileSync(path.join(CLAUDE_HOME, 'settings.json'), 'utf8'));
+    return JSON.stringify(s.hooks || {}).includes('mission-control');
+  } catch { return false; }
 }
 
 // ---------- HTTP ----------
@@ -128,7 +191,7 @@ function readBody(req) {
     let size = 0; const chunks = [];
     req.on('data', (c) => {
       size += c.length;
-      if (size > 1_000_000) { reject(new Error('payload too large')); req.destroy(); return; }
+      if (size > 2_000_000) { reject(new Error('payload too large')); req.destroy(); return; }
       chunks.push(c);
     });
     req.on('end', () => {
@@ -155,14 +218,45 @@ function mutate(fn) {
   return result;
 }
 
+// Événement envoyé par les hooks Claude Code (scripts/hook.js)
+export function applyHookEvent(state, ev) {
+  const now = new Date().toISOString();
+  const project = ev.project || '';
+  state.agentStatus ||= {};
+  state.logs ||= [];
+  const log = (agent, message, detail = '') => state.logs.push({ id: newId('log'), ts: now, agent, message, detail, project });
+  if (ev.type === 'agent_start' && ev.agent) {
+    const st = (state.agentStatus[ev.agent] ||= {});
+    Object.assign(st, { status: 'online', running: true, currentTask: ev.task || '', lastSeen: now, runs: (st.runs || 0) + 1 });
+    log(ev.agent, `▶ ${ev.task || 'Démarrage'}`, project ? `Projet : ${project}` : '');
+  } else if (ev.type === 'agent_end' && ev.agent) {
+    const st = (state.agentStatus[ev.agent] ||= {});
+    Object.assign(st, { status: 'online', running: false, lastSeen: now, lastTask: ev.task || st.currentTask || '', currentTask: '' });
+    log(ev.agent, `✓ ${ev.task || 'Terminé'}`, ev.summary || '');
+  } else if (ev.type === 'session_end') {
+    for (const st of Object.values(state.agentStatus)) if (st.running) { st.running = false; st.currentTask = ''; }
+    log('system', 'Session ended', project ? `Projet : ${project}` : '');
+  } else if (ev.type === 'log' && ev.message) {
+    log(ev.agent || 'system', ev.message, ev.detail || '');
+  }
+}
+
 async function api(req, res, url) {
-  const parts = url.pathname.split('/').filter(Boolean).slice(1); // sans "api"
+  const parts = url.pathname.split('/').filter(Boolean).slice(1).map(decodeURIComponent);
   const method = req.method;
 
   if (method === 'GET' && parts[0] === 'state') {
     const state = readState();
     if (!state) return send(res, 503, { error: 'state.json illisible' });
-    return send(res, 200, { ...state, agents: readAgents(state), skills: readSkills(), serverTime: new Date().toISOString() });
+    const sources = discoverSources(state);
+    return send(res, 200, {
+      ...state,
+      agents: readAgents(state, sources),
+      skills: readSkills(sources),
+      sources: sources.map(({ id, label, kind, root, auto, missing }) => ({ id, label, kind, root, auto, missing: !!missing })),
+      system: { claudeHome: CLAUDE_HOME, hooksInstalled: hooksInstalled(), hookScript: HOOK_SCRIPT, platform: process.platform },
+      serverTime: new Date().toISOString(),
+    });
   }
 
   if (method === 'GET' && parts[0] === 'events') {
@@ -172,6 +266,12 @@ async function api(req, res, url) {
     const ping = setInterval(() => res.write(': ping\n\n'), 25000);
     req.on('close', () => { clearInterval(ping); clients.delete(res); });
     return;
+  }
+
+  if (method === 'POST' && parts[0] === 'hook') {
+    const body = await readBody(req);
+    mutate((s) => applyHookEvent(s, body));
+    return send(res, 200, { ok: true });
   }
 
   if (method === 'PATCH' && parts[0] === 'settings') {
@@ -184,12 +284,17 @@ async function api(req, res, url) {
     return send(res, 200, mutate((s) => {
       s.agentStatus ||= {};
       const cur = s.agentStatus[parts[1]] || {};
-      return (s.agentStatus[parts[1]] = { ...cur, ...pick(body, ['status', 'currentTask']), lastSeen: new Date().toISOString() });
+      const next = { ...cur, ...pick(body, ['status', 'currentTask']) };
+      if (body.status === 'online') next.lastSeen = new Date().toISOString();
+      if (body.status === 'idle') next.lastSeen = null;
+      return (s.agentStatus[parts[1]] = next);
     }));
   }
 
   if (method === 'POST' && parts[0] === 'reset') {
+    const cur = readState();
     const seed = buildSeed();
+    if (cur?.settings) seed.settings = { ...seed.settings, ...cur.settings }; // on garde les réglages
     writeState(seed);
     broadcast();
     return send(res, 200, { ok: true });
@@ -198,7 +303,7 @@ async function api(req, res, url) {
   if (method === 'POST' && parts[0] === 'import') {
     const body = await readBody(req);
     for (const c of COLLECTIONS) if (!Array.isArray(body[c])) return send(res, 400, { error: `champ "${c}" manquant` });
-    writeState({ version: 1, settings: body.settings || {}, agentStatus: body.agentStatus || {}, ...Object.fromEntries([...COLLECTIONS].map((c) => [c, body[c]])) });
+    writeState({ version: 2, settings: { ...buildSeed().settings, ...(body.settings || {}) }, agentStatus: body.agentStatus || {}, ...Object.fromEntries([...COLLECTIONS].map((c) => [c, body[c]])) });
     broadcast();
     return send(res, 200, { ok: true });
   }
@@ -265,30 +370,36 @@ export function start(port = PORT, host = HOST) {
     }
   });
 
-  // Les agents écrivent directement dans les fichiers : on surveille et on rafraîchit.
   let debounce;
   const onFsChange = () => {
     if (Date.now() < suppressWatchUntil) return;
     clearTimeout(debounce);
-    debounce = setTimeout(() => broadcast(), 120);
+    debounce = setTimeout(() => broadcast(), 150);
   };
-  // Surveillance non récursive : le mode récursif de Linux perd la trace d'un fichier
-  // remplacé par renommage atomique (ce que font writeState et la CLI).
+
+  // Surveillance non récursive (le mode récursif de Linux perd les fichiers remplacés par
+  // renommage) de data/ et des dossiers agents/skills de chaque source, re-scannés toutes les 5 s.
   const watchers = new Map();
   const watchDir = (dir) => {
     if (watchers.has(dir) || !fs.existsSync(dir)) return;
-    try { watchers.set(dir, fs.watch(dir, onFsChange)); } catch { /* ignoré */ }
+    try {
+      const w = fs.watch(dir, onFsChange);
+      w.on('error', () => { w.close(); watchers.delete(dir); });
+      watchers.set(dir, w);
+    } catch { /* ignoré */ }
   };
-  const watchSkills = () => {
-    watchDir(SKILLS_DIR);
-    if (!fs.existsSync(SKILLS_DIR)) return;
-    for (const d of fs.readdirSync(SKILLS_DIR, { withFileTypes: true })) if (d.isDirectory()) watchDir(path.join(SKILLS_DIR, d.name));
+  const watchAll = () => {
+    watchDir(DATA_DIR);
+    const state = readState();
+    for (const src of discoverSources(state)) {
+      watchDir(path.join(src.claudeDir, 'agents'));
+      const skills = path.join(src.claudeDir, 'skills');
+      watchDir(skills);
+      try { for (const d of fs.readdirSync(skills, { withFileTypes: true })) if (d.isDirectory()) watchDir(path.join(skills, d.name)); } catch { /* pas de skills */ }
+    }
   };
-  watchDir(DATA_DIR);
-  watchDir(AGENTS_DIR);
-  watchSkills();
-  const rescan = setInterval(watchSkills, 5000); // nouveaux dossiers de skills
-  // Filet de sécurité (volumes Docker, partages réseau…) : polling léger du fichier d'état.
+  watchAll();
+  const rescan = setInterval(watchAll, 5000);
   fs.watchFile(STATE_FILE, { interval: 1000 }, (cur, prev) => { if (cur.mtimeMs !== prev.mtimeMs) onFsChange(); });
 
   const close = server.close.bind(server);
@@ -302,7 +413,11 @@ export function start(port = PORT, host = HOST) {
   };
 
   server.listen(port, host, () => {
-    console.log(`\n  ▸ Mission Control : http://${host === '0.0.0.0' ? 'localhost' : host}:${port}\n`);
+    const { port: p } = server.address();
+    console.log(`\n  ▸ Mission Control : http://${host === '0.0.0.0' ? 'localhost' : host}:${p}`);
+    console.log(`  ▸ Agents lus depuis : ${CLAUDE_HOME} + tes projets Claude Code`);
+    if (!hooksInstalled()) console.log('  ▸ Suivi automatique non installé : lance « npm run install-hooks »');
+    console.log('');
   });
   return server;
 }

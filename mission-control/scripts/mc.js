@@ -72,7 +72,7 @@ switch (cmd) {
       let item;
       if (cmd === 'task') {
         if (!rest[0]) die('usage : task add "<titre>"');
-        item = { title: rest[0], category: flags.category || 'Ops', priority: flags.priority || 'P2', status: flags.status || 'todo', due: flags.due || '', agent: flags.agent || '', notes: flags.notes || '' };
+        item = { title: rest[0], category: flags.category || state.settings.categories?.[0] || 'Perso', priority: flags.priority || 'P2', status: flags.status || 'todo', due: flags.due || '', agent: flags.agent || '', notes: flags.notes || '' };
       } else if (cmd === 'content') {
         if (!rest[0]) die('usage : content add "<titre>"');
         item = { title: rest[0], stage: flags.stage || 'idea', format: flags.format || 'Reel', platforms: String(flags.platforms || 'Instagram,TikTok').split(',').map((s) => s.trim()), agent: flags.agent || 'content-agent', notes: flags.notes || '' };

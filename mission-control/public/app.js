@@ -50,8 +50,11 @@ const NAV = [
   ['/analytics', 'Analytics', 'chart'], ['/logs', 'Logs', 'logs'], ['/memory', 'Memory', 'brain'],
   ['/settings', 'Settings', 'settings'],
 ];
-const CATEGORIES = ['Collabs', 'Content', 'Ops', 'Newsletter', 'Consulting', 'Personal'];
-const CAT_TAG = { Content: 'blue', Consulting: 'green', Collabs: 'orange', Ops: 'gray', Newsletter: 'violet', Personal: 'pink' };
+const cats = () => (S?.settings?.categories?.length ? S.settings.categories : ['Trading', 'YouTube', 'App Coran', 'Perso']);
+const TAG_COLORS = ['blue', 'green', 'orange', 'violet', 'pink', 'yellow', 'red'];
+const catTag = (c) => { const i = cats().indexOf(c); return i < 0 ? 'gray' : TAG_COLORS[i % TAG_COLORS.length]; };
+const ALWAYS_VISIBLE = ['/', '/agents', '/settings'];
+const pageVisible = (href) => ALWAYS_VISIBLE.includes(href) || !(S?.settings?.hiddenPages || []).includes(href);
 const TASK_COLS = [
   { key: 'todo', label: 'To Do', icon: 'circle', head: 'gray' },
   { key: 'in_progress', label: 'In Progress', icon: 'loader', head: 'blue' },
@@ -76,7 +79,6 @@ const DEAL_STAGES = [
   { key: 'lost', label: 'Lost', icon: 'x', head: 'red' },
 ];
 const OPEN_DEAL = (d) => !['won', 'lost'].includes(d.stage);
-const NODE_COLOR = { 'brain-agent': 'pink', 'self-improve-agent': 'green' };
 
 // ---------------------------------------------------------------- état
 let S = null;
@@ -134,13 +136,14 @@ function ago(d) {
   if (s < 86400) return `${Math.floor(s / 3600)}h`;
   return `${Math.floor(s / 86400)}d`;
 }
+const agoText = (d) => { const a = ago(d); return a === 'now' ? 'just now' : `${a} ago`; };
 const isOverdue = (t) => t.status !== 'done' && t.due && parseDue(t.due) < today();
 const ymd = (d) => { const p = (n) => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`; };
 
 // ---------------------------------------------------------------- shell
 function renderNav() {
   const path = location.pathname;
-  $('#nav').innerHTML = NAV.map(([href, label, ic]) =>
+  $('#nav').innerHTML = NAV.filter(([href]) => pageVisible(href)).map(([href, label, ic]) =>
     `<a href="${href}" data-link class="${path === href ? 'active' : ''}" ${path === href ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span></a>`).join('');
   const name = S?.settings?.name || 'CIPHER';
   $('#brand-name').textContent = name.toUpperCase();
@@ -161,7 +164,7 @@ function render() {
   if (!S) return;
   if (ui.dragging) { ui.pendingRender = true; return; }
   renderNav();
-  const page = PAGES[location.pathname] || PAGES['/'];
+  const page = (pageVisible(location.pathname) && PAGES[location.pathname]) || PAGES['/'];
   $('#main').innerHTML = page();
   afterRender[location.pathname]?.();
 }
@@ -176,38 +179,52 @@ function navigate(href) {
 }
 
 // ---------------------------------------------------------------- Command Center
+const isHookLog = (l) => typeof l.message === 'string' && l.message.startsWith('▶');
+const dot = (a) => (a.running ? 'dot-blue pulse-dot' : a.status === 'online' ? 'dot-good' : `dot-${a.status}`);
+
 PAGES['/'] = () => {
   const active = S.tasks.filter((t) => ['todo', 'in_progress', 'blocked'].includes(t.status));
   const inProg = S.tasks.filter((t) => t.status === 'in_progress').length;
   const online = S.agents.filter((a) => a.status === 'online').length;
-  const openDeals = S.deals.filter(OPEN_DEAL);
-  const pipelineValue = openDeals.reduce((s, d) => s + (Number(d.value) || 0), 0);
-  const week = S.pipeline.filter((c) => c.stage === 'posted' && c.postedAt && dayDiff(new Date(), c.postedAt) < 7);
+  const running = S.agents.filter((a) => a.running);
+  const runsToday = S.logs.filter((l) => isHookLog(l) && dayDiff(new Date(), l.ts) === 0).length;
 
   const alerts = [
     ...S.tasks.filter(isOverdue).map((t) => ({ title: t.title, sub: `Overdue · was due ${fmtShort(parseDue(t.due))}`, prio: t.priority, id: t.id })),
     ...S.tasks.filter((t) => t.status === 'blocked').map((t) => ({ title: t.title, sub: 'Blocked', prio: t.priority, id: t.id })),
-    ...S.agents.filter((a) => a.status === 'offline').map((a) => ({ title: `${a.label} is offline`, sub: a.lastSeen ? `Last seen ${ago(a.lastSeen)} ago` : 'Never seen' })),
+    ...S.agents.filter((a) => a.status === 'offline').map((a) => ({ title: `${a.label} is offline`, sub: a.lastSeen ? `Last seen ${agoText(a.lastSeen)}` : 'Never seen' })),
   ];
-  const recent = [...S.tasks].sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)).slice(0, 6);
+  if (!S.system.hooksInstalled) alerts.push({ title: 'Automatic tracking is not installed', sub: 'Run « npm run install-hooks » in the mission-control folder, then restart Claude Code', href: '/settings' });
+  const recent = [...S.logs].filter((l) => l.agent !== 'system').sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 7);
 
-  // 7 derniers jours de publication
+  // exécutions d'agents sur 7 jours
   const days = [...Array(7)].map((_, i) => { const d = today(); d.setDate(d.getDate() - 6 + i); return d; });
-  const perDay = days.map((d) => S.pipeline.filter((c) => c.stage === 'posted' && c.postedAt && dayDiff(c.postedAt, d) === 0).length);
+  const perDay = days.map((d) => S.logs.filter((l) => isHookLog(l) && dayDiff(l.ts, d) === 0).length);
   const maxDay = Math.max(1, ...perDay);
+  const weekTotal = perDay.reduce((a, b) => a + b, 0);
 
   const kpi = (ic, label, value, foot, href) => `
     <a class="card kpi" href="${href}" data-link>
       <div class="kpi-top"><span class="kpi-icon">${icon(ic)}</span><span class="kpi-label">${label}</span></div>
       <div class="kpi-value">${value}</div><div class="kpi-foot">${foot}</div>
     </a>`;
+  let fourth;
+  if (pageVisible('/deals')) {
+    const open = S.deals.filter(OPEN_DEAL);
+    fourth = kpi('dollar', 'Deal Pipeline', money(open.reduce((s, d) => s + (Number(d.value) || 0), 0)), `${open.length} open deals`, '/deals');
+  } else if (pageVisible('/pipeline')) {
+    const week = S.pipeline.filter((c) => c.stage === 'posted' && c.postedAt && dayDiff(new Date(), c.postedAt) < 7).length;
+    fourth = kpi('video', 'Content', week, `posted this week · ${S.pipeline.filter((c) => c.stage !== 'posted').length} in production`, '/pipeline');
+  } else {
+    fourth = kpi('spark', 'Skills', S.skills.length, `${S.sources.length} sources`, '/skills');
+  }
 
-  return `${head('Command Center', 'Mission Control')}
+  return `${head('Command Center', esc(S.settings.owner ? `Mission Control · ${S.settings.owner}` : 'Mission Control'))}
   <div class="kpis">
     ${kpi('list', 'Active Tasks', active.length, `${inProg} in progress`, '/board')}
-    ${kpi('bot', 'Agents Online', `${online}<span class="of">/${S.agents.length}</span>`, `${S.agents.length - online} idle or offline`, '/agents')}
-    ${kpi('dollar', 'Deal Pipeline', money(pipelineValue), `${openDeals.length} open deals`, '/deals')}
-    ${kpi('video', 'Content', week.length, 'posted this week', '/pipeline')}
+    ${kpi('bot', 'Agents Online', `${online}<span class="of">/${S.agents.length}</span>`, running.length ? `${running.length} running now` : 'active in the last 24h', '/agents')}
+    ${kpi('activity', 'Agent Runs', runsToday, 'today', '/logs')}
+    ${fourth}
   </div>
   <div class="cc-grid">
     <div class="stack">
@@ -216,33 +233,34 @@ PAGES['/'] = () => {
         ${alerts.length ? alerts.map((a) => `
           <div class="alert" ${a.id ? `data-action="edit-task" data-id="${a.id}" role="button" tabindex="0" style="cursor:pointer"` : ''}>
             <span class="dot dot-critical" style="margin-top:6px"></span>
-            <div><div class="alert-title">${esc(a.title)}</div><div class="alert-sub">${esc(a.sub)}</div></div>
+            <div><div class="alert-title">${a.href ? `<a href="${a.href}" data-link>${esc(a.title)}</a>` : esc(a.title)}</div><div class="alert-sub">${esc(a.sub)}</div></div>
             ${a.prio ? `<span class="prio prio-${esc(a.prio)}">${esc(a.prio)}</span>` : ''}
           </div>`).join('') : '<div class="empty">Nothing needs attention. ✓</div>'}
       </section>
       <section class="card card-pad">
-        <h2 class="section-title">${icon('activity')} Recent Activity</h2>
+        <h2 class="section-title">${icon('activity')} Recent Activity <a class="count" href="/logs" data-link>all logs →</a></h2>
         <ul class="activity">
-          ${recent.map((t) => `
-            <li><span class="dot ${STATUS_DOT[t.status] || ''}"></span>
-              <div><div class="activity-title">${esc(t.title)}</div>
-              <div class="activity-meta"><span>${esc(t.category)}</span><span>•</span><span>${STATUS_LABEL[t.status] || esc(t.status)}</span>${t.agent ? `<span>•</span><span class="mono">${esc(t.agent)}</span>` : ''}</div></div>
-            </li>`).join('') || '<li class="empty">No tasks yet.</li>'}
+          ${recent.map((l) => `
+            <li><span class="dot ${l.message.startsWith('✓') ? 'dot-good' : 'dot-blue'}"></span>
+              <div><div class="activity-title">${esc(l.message)}</div>
+              <div class="activity-meta"><span class="mono">${esc(l.agent)}</span>${l.project ? `<span>•</span><span>${esc(l.project)}</span>` : ''}<span>•</span><span>${agoText(l.ts)}</span></div></div>
+            </li>`).join('') || '<li class="empty">No agent activity yet. Launch one of your agents in Claude Code and it will show up here.</li>'}
         </ul>
       </section>
     </div>
     <div class="stack">
       <section class="card card-pad">
-        <h2 class="section-title">${icon('bot')} Agent Status</h2>
+        <h2 class="section-title">${icon('bot')} Agent Status <span class="count">${S.agents.length}</span></h2>
         <ul class="agent-list">
-          ${S.agents.map((a) => `<li title="${esc(a.currentTask || a.status)}"><span class="dot dot-${a.status === 'online' ? 'good' : a.status}"></span>${esc(a.name)}<span class="when">${ago(a.lastSeen)}</span></li>`).join('')}
+          ${S.agents.map((a) => `<li title="${esc(a.currentTask || a.status)}"><span class="dot ${dot(a)}"></span><span>${esc(a.name)}${a.running ? ` <span class="muted" style="font-size:11px">· ${esc(a.currentTask || 'running')}</span>` : ''}</span><span class="when">${a.lastSeen ? ago(a.lastSeen) : '—'}</span></li>`).join('')
+            || `<li class="empty">No agents found. Create some in <code class="inline">~/.claude/agents/</code> or in a project's <code class="inline">.claude/agents/</code>.</li>`}
         </ul>
       </section>
       <section class="card card-pad">
-        <h2 class="section-title">${icon('calendar')} This Week <span class="count">${week.length} posted</span></h2>
+        <h2 class="section-title">${icon('calendar')} This Week <span class="count">${weekTotal} runs</span></h2>
         <div class="week">
           ${days.map((d, i) => `
-            <div class="week-col" data-tip="<b>${perDay[i]}</b> posted · ${fmtShort(d)}">
+            <div class="week-col" data-tip="<b>${perDay[i]}</b> agent runs · ${fmtShort(d)}">
               <div class="week-bar ${perDay[i] ? '' : 'zero'}" style="height:${perDay[i] ? Math.max(8, (perDay[i] / maxDay) * 64) : 2}px"></div>
               <span class="week-day ${i === 6 ? 'today' : ''}">${d.toLocaleDateString('en-US', { weekday: 'narrow' })}</span>
             </div>`).join('')}
@@ -253,113 +271,134 @@ PAGES['/'] = () => {
 };
 
 // ---------------------------------------------------------------- Agents
+const ROOT_ID = '__claude__';
+const SOURCE_COLORS = ['blue', 'green', 'violet', 'pink', 'orange', 'yellow'];
+const sourceColor = (src) => SOURCE_COLORS[Math.max(0, S.sources.findIndex((s) => s.label === src)) % SOURCE_COLORS.length];
+
+// Réseau : Claude Code (session principale) → tes agents. Si un agent déclare `connects: [...]`
+// dans son frontmatter, on dessine aussi ces délégations. Colonnes de 5 agents max.
 function layoutNetwork(agents) {
-  const names = new Set(agents.map((a) => a.name));
-  const edges = agents.flatMap((a) => a.connects.filter((t) => names.has(t) && t !== a.name).map((t) => [a.name, t]));
-  const depth = Object.fromEntries(agents.map((a) => [a.name, 0]));
-  for (let i = 0; i < agents.length; i++) { // plus long chemin (borné → résiste aux cycles)
-    for (const [s, t] of edges) if (depth[t] < depth[s] + 1 && depth[s] + 1 < agents.length) depth[t] = depth[s] + 1;
+  const byName = new Map();
+  agents.forEach((a) => { if (!byName.has(a.name)) byName.set(a.name, a.id); });
+  const edges = agents.flatMap((a) => a.connects.map((t) => byName.get(t)).filter((t) => t && t !== a.id).map((t) => [a.id, t]));
+  const hasParent = new Set(edges.map(([, t]) => t));
+  agents.forEach((a) => { if (!hasParent.has(a.id)) edges.push([ROOT_ID, a.id]); });
+  const ids = [ROOT_ID, ...agents.map((a) => a.id)];
+  const depth = Object.fromEntries(ids.map((id) => [id, 0]));
+  for (let i = 0; i < ids.length; i++) {
+    for (const [s, t] of edges) if (depth[t] < depth[s] + 1 && depth[s] + 1 < ids.length) depth[t] = depth[s] + 1;
   }
-  const cols = [];
-  for (const a of agents) (cols[depth[a.name]] ||= []).push(a.name);
-  // ordre barycentrique pour limiter les croisements
-  const pos = {};
-  cols.forEach((col, ci) => {
-    if (ci > 0) {
-      const bary = (n) => { const ps = edges.filter(([, t]) => t === n).map(([s]) => pos[s]).filter((v) => v !== undefined); return ps.length ? ps.reduce((x, y) => x + y, 0) / ps.length : 99; };
-      col.sort((a, b) => bary(a) - bary(b));
-    }
-    col.forEach((n, i) => { pos[n] = i; });
-  });
-  const W = 196, H = 108, GX = 64, GY = 20;
-  const maxRows = Math.max(...cols.map((c) => c.length));
+  const levels = [];
+  for (const id of ids) (levels[depth[id]] ||= []).push(id);
+  const MAX_ROWS = 5;
+  const cols = levels.filter(Boolean).flatMap((lvl) => { const out = []; for (let i = 0; i < lvl.length; i += MAX_ROWS) out.push(lvl.slice(i, i + MAX_ROWS)); return out; });
+  const W = 210, H = 108, GX = 56, GY = 18;
+  const maxRows = Math.max(1, ...cols.map((c) => c.length));
   const height = maxRows * (H + GY) - GY;
   const xy = {};
   cols.forEach((col, ci) => {
     const colH = col.length * (H + GY) - GY;
-    col.forEach((n, i) => { xy[n] = { x: ci * (W + GX), y: (height - colH) / 2 + i * (H + GY) }; });
+    col.forEach((id, i) => { xy[id] = { x: ci * (W + GX), y: (height - colH) / 2 + i * (H + GY) }; });
   });
-  return { edges, xy, W, H, width: cols.length * (W + GX) - GX, height };
+  return { edges, xy, W, H, width: Math.max(W, cols.length * (W + GX) - GX), height, explicit: edges.filter(([s]) => s !== ROOT_ID).length };
 }
 
 PAGES['/agents'] = () => {
-  const { edges, xy, W, H, width, height } = layoutNetwork(S.agents);
-  const by = Object.fromEntries(S.agents.map((a) => [a.name, a]));
+  if (!S.agents.length) {
+    return `${head('Agent Network', 'System topology')}
+    <section class="card card-pad">
+      <h2 class="section-title">${icon('bot')} No agents found yet</h2>
+      <p style="margin-top:0">Mission Control reads your Claude Code agents from:</p>
+      <ul style="font-size:13px;line-height:1.8">
+        <li><code class="inline">${esc(S.system.claudeHome)}${S.system.platform === 'win32' ? '\\' : '/'}agents\\*.md</code> (global agents)</li>
+        <li><code class="inline">&lt;project&gt;/.claude/agents/*.md</code> for every project you opened with Claude Code, and for the folders you add in <a href="/settings" data-link><u>Settings</u></a></li>
+      </ul>
+      <p class="muted" style="font-size:12.5px;margin-bottom:0">Create one in Claude Code with the <code class="inline">/agents</code> command — it appears here instantly.</p>
+    </section>`;
+  }
+  const { edges, xy, W, H, width, height, explicit } = layoutNetwork(S.agents);
+  const by = Object.fromEntries(S.agents.map((a) => [a.id, a]));
   const sel = by[ui.agents.selected];
-  const recent = (a) => a.status === 'online' && a.lastSeen && Date.now() - new Date(a.lastSeen) < 864e5;
   const paths = edges.map(([s, t]) => {
     const a = xy[s], b = xy[t];
     const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, mx = (x1 + x2) / 2;
-    const hot = recent(by[s]) && recent(by[t]);
+    const hot = by[t]?.running || (s !== ROOT_ID && by[s]?.running);
     return `<path class="edge ${hot ? 'hot' : ''}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
   }).join('');
   const counts = { online: 0, idle: 0, offline: 0 };
   S.agents.forEach((a) => { counts[a.status] = (counts[a.status] || 0) + 1; });
+  const runningN = S.agents.filter((a) => a.running).length;
 
+  const root = `<div class="node node-root" style="left:${xy[ROOT_ID].x}px;top:${xy[ROOT_ID].y}px;width:${W}px;height:${H}px">
+      <div class="node-head"><span class="node-icon">${icon('cpu')}</span><div class="node-name"><span class="dot dot-good"></span>Claude Code</div></div>
+      <div class="node-desc">Main session — delegates work to your agents</div>
+      <span class="node-model">${S.sources.length} source${S.sources.length > 1 ? 's' : ''}</span></div>`;
   const node = (a) => `
-    <button class="node node-${NODE_COLOR[a.name] || 'blue'} ${ui.agents.selected === a.name ? 'selected' : ''}" style="left:${xy[a.name].x}px;top:${xy[a.name].y}px;height:${H}px"
-      data-action="select-agent" data-name="${esc(a.name)}">
+    <button class="node node-${a.color || sourceColor(a.source)} ${ui.agents.selected === a.id ? 'selected' : ''} ${a.running ? 'running' : ''}" style="left:${xy[a.id].x}px;top:${xy[a.id].y}px;width:${W}px;height:${H}px"
+      data-action="select-agent" data-id="${esc(a.id)}">
       <div class="node-head"><span class="node-icon">${icon(a.icon)}</span>
-        <div><div class="node-name"><span class="dot dot-${a.status === 'online' ? 'good' : a.status}"></span>${esc(a.label)}</div></div></div>
-      <div class="node-desc">${esc(a.description)}</div>
-      <span class="node-model">${esc(a.model)}</span>
+        <div style="min-width:0"><div class="node-name"><span class="dot ${dot(a)}"></span><span class="ellipsis">${esc(a.label)}</span></div></div></div>
+      <div class="node-desc">${esc(a.running ? `▶ ${a.currentTask || 'running…'}` : a.description)}</div>
+      <span class="node-model">${esc(a.model)}</span> <span class="node-model">${esc(a.source)}</span>
     </button>`;
 
   const panel = sel ? `
     <aside class="card panel">
-      <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-${sel.status === 'online' ? 'good' : sel.status}"></span><h3>${esc(sel.label)}</h3>
-        <button class="icon-btn" style="margin-left:auto" data-action="select-agent" data-name="${esc(sel.name)}" aria-label="Close">${icon('x')}</button></div>
+      <div style="display:flex;align-items:center;gap:8px"><span class="dot ${dot(sel)}"></span><h3>${esc(sel.label)}</h3>
+        <button class="icon-btn" style="margin-left:auto" data-action="select-agent" data-id="${esc(sel.id)}" aria-label="Close">${icon('x')}</button></div>
       <p class="muted" style="font-size:12.5px">${esc(sel.description)}</p>
       <dl class="kv">
-        <dt>Status</dt><dd>
-          <select data-action="agent-status" data-name="${esc(sel.name)}" aria-label="Status">
-            ${['online', 'idle', 'offline'].map((s) => `<option ${s === sel.status ? 'selected' : ''}>${s}</option>`).join('')}
+        <dt>Status</dt><dd>${sel.running ? '<b>running</b> · ' : ''}${esc(sel.status)}
+          <select data-action="agent-status" data-name="${esc(sel.name)}" aria-label="Override status" style="margin-left:6px">
+            <option value="">change…</option>${['online', 'idle', 'offline'].map((s) => `<option value="${s}">${s}</option>`).join('')}
           </select></dd>
+        <dt>Source</dt><dd>${esc(sel.source)}</dd>
         <dt>Model</dt><dd class="mono">${esc(sel.model)}</dd>
-        <dt>Last seen</dt><dd>${sel.lastSeen ? `${ago(sel.lastSeen)} ago` : '—'}</dd>
+        <dt>Last run</dt><dd>${sel.lastSeen ? `${agoText(sel.lastSeen)}` : 'never'}</dd>
+        <dt>Runs</dt><dd>${sel.runs}</dd>
         <dt>Working on</dt><dd>${esc(sel.currentTask || '—')}</dd>
-        <dt>Delegates to</dt><dd>${sel.connects.map((c) => `<code class="inline">${esc(c)}</code>`).join(' ') || '—'}</dd>
+        ${sel.connects.length ? `<dt>Delegates to</dt><dd>${sel.connects.map((c) => `<code class="inline">${esc(c)}</code>`).join(' ')}</dd>` : ''}
         <dt>Tools</dt><dd>${sel.tools.length ? esc(sel.tools.join(', ')) : 'all (inherit)'}</dd>
-        <dt>File</dt><dd><code class="inline">${esc(sel.file)}</code></dd>
+        <dt>File</dt><dd><code class="inline" style="word-break:break-all">${esc(sel.file)}</code></dd>
         <dt>Open tasks</dt><dd>${S.tasks.filter((t) => t.agent === sel.name && t.status !== 'done').length}</dd>
       </dl>
       <h2 class="section-title">System prompt</h2>
       <pre>${esc(sel.prompt)}</pre>
       <h2 class="section-title" style="margin-top:16px">Recent logs</h2>
-      ${S.logs.filter((l) => l.agent === sel.name).sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 5)
-        .map((l) => `<div style="font-size:12.5px;margin-bottom:8px"><span class="mono muted">${fmtShort(l.ts)} ${fmtTime(l.ts)}</span><br>${esc(l.message)}</div>`).join('') || '<div class="empty">No logs yet.</div>'}
+      ${S.logs.filter((l) => l.agent === sel.name).sort((a, b) => new Date(b.ts) - new Date(a.ts)).slice(0, 6)
+        .map((l) => `<div style="font-size:12.5px;margin-bottom:8px"><span class="mono muted">${fmtShort(l.ts)} ${fmtTime(l.ts)}${l.project ? ` · ${esc(l.project)}` : ''}</span><br>${esc(l.message)}</div>`).join('') || '<div class="empty">No runs recorded yet.</div>'}
     </aside>` : '';
 
+  const groups = S.sources.map((src) => ({ src, list: S.agents.filter((a) => a.source === src.label) })).filter((g) => g.list.length);
   return `${head('Agent Network', 'System topology')}
-  <div class="agents-layout ${sel ? 'with-panel' : ''}">
-    <div class="stack">
-      <section class="card network-card">
-        <h2 class="section-title">${icon('bot')} Agent Workflow <span class="tag">${S.agents.length} agents</span></h2>
-        ${S.agents.length ? `<div class="network-wrap"><div class="network" style="width:${width}px;height:${height}px">
-          <svg class="edges" width="${width}" height="${height}">${paths}</svg>
-          ${S.agents.map(node).join('')}
-        </div></div>` : '<div class="empty">No agents found in <code class="inline">.claude/agents/</code>.</div>'}
-        <div class="network-foot">
-          <span><span class="dot dot-good"></span>${counts.online} Active</span>
-          <span><span class="dot dot-idle"></span>${counts.idle} Idle</span>
-          ${counts.offline ? `<span><span class="dot dot-offline"></span>${counts.offline} Offline</span>` : ''}
-          <span>→ ${edges.length} Connections</span>
-        </div>
-      </section>
-      <section>
-        <h2 class="section-title">All Agents</h2>
-        <div class="grid-cards">
-          ${S.agents.map((a) => `
-            <button class="card agent-card" data-action="select-agent" data-name="${esc(a.name)}">
-              <div style="display:flex;align-items:center;gap:8px"><span class="dot dot-${a.status === 'online' ? 'good' : a.status}"></span><b style="font-size:13.5px">${esc(a.label)}</b><span class="node-model" style="margin:0 0 0 auto">${esc(a.model)}</span></div>
-              <div class="desc">${esc(a.description)}</div>
-              <div class="kcard-meta" style="margin-top:8px"><span>${S.tasks.filter((t) => t.agent === a.name && t.status !== 'done').length} open tasks</span><span>•</span><span>seen ${ago(a.lastSeen)}</span></div>
-            </button>`).join('')}
-        </div>
-      </section>
-    </div>
-    ${panel}
-  </div>`;
+  <div class="stack">
+    <section class="card network-card">
+      <h2 class="section-title">${icon('bot')} Agent Workflow <span class="tag">${S.agents.length} agents</span></h2>
+      <div class="network-wrap"><div class="network" style="width:${width}px;height:${height}px">
+        <svg class="edges" width="${width}" height="${height}">${paths}</svg>
+        ${root}${S.agents.map(node).join('')}
+      </div></div>
+      <div class="network-foot">
+        ${runningN ? `<span><span class="dot dot-blue"></span>${runningN} Running</span>` : ''}
+        <span><span class="dot dot-good"></span>${counts.online} Active (24h)</span>
+        <span><span class="dot dot-idle"></span>${counts.idle} Idle</span>
+        ${counts.offline ? `<span><span class="dot dot-offline"></span>${counts.offline} Offline</span>` : ''}
+        <span>→ ${edges.length} Connections${explicit ? ` (${explicit} declared)` : ''}</span>
+        <span style="margin-left:auto">${S.sources.filter((s) => S.agents.some((a) => a.source === s.label)).map((s) => `<span class="tag tag-${sourceColor(s.label)}">${esc(s.label)}</span>`).join(' ')}</span>
+      </div>
+    </section>
+    ${groups.map((g) => `<section>
+      <h2 class="section-title">${icon(g.src.kind === 'user' ? 'user' : 'doc')} ${esc(g.src.kind === 'user' ? 'Global agents' : g.src.label)} <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">${esc(g.src.root)}</span></h2>
+      <div class="grid-cards">
+        ${g.list.map((a) => `
+          <button class="card agent-card" data-action="select-agent" data-id="${esc(a.id)}">
+            <div style="display:flex;align-items:center;gap:8px"><span class="dot ${dot(a)}"></span><b style="font-size:13.5px">${esc(a.label)}</b><span class="node-model" style="margin:0 0 0 auto">${esc(a.model)}</span></div>
+            <div class="desc">${esc(a.description)}</div>
+            <div class="kcard-meta" style="margin-top:8px"><span>${a.runs} runs</span><span>•</span><span>${a.lastSeen ? `last ${agoText(a.lastSeen)}` : 'never run'}</span></div>
+          </button>`).join('')}
+      </div></section>`).join('')}
+  </div>
+  ${panel}`;
 };
 
 // ---------------------------------------------------------------- Kanban générique
@@ -383,7 +422,7 @@ PAGES['/board'] = () => {
   const pct = items.length ? Math.round((done / items.length) * 100) : 0;
   const card = (t) => `
     <div class="kcard ${isOverdue(t) ? 'overdue' : ''}" draggable="true" data-drag="task" data-id="${t.id}" data-action="edit-task" tabindex="0">
-      <div class="kcard-top"><span class="tag tag-${CAT_TAG[t.category] || 'gray'}">${esc(t.category)}</span><span class="prio prio-${esc(t.priority)}">${esc(t.priority)}</span></div>
+      <div class="kcard-top"><span class="tag tag-${catTag(t.category)}">${esc(t.category)}</span><span class="prio prio-${esc(t.priority)}">${esc(t.priority)}</span></div>
       <div class="kcard-title">${esc(t.title)}</div>
       <div class="kcard-meta">
         ${t.due ? `<span class="${isOverdue(t) ? 'late' : ''}">${isOverdue(t) ? '⊘ ' : ''}${fmtShort(parseDue(t.due))}</span>` : ''}
@@ -392,7 +431,7 @@ PAGES['/board'] = () => {
     </div>`;
   return `${head('Task Board', 'Active work items', `<button class="btn btn-primary" data-action="new-task">${icon('plus')} New task</button>`)}
   <div class="card toolbar">
-    <div class="chips">${['All', ...CATEGORIES].map((c) => `<button class="chip ${cat === c ? 'active' : ''}" data-action="board-cat" data-v="${c}">${c}</button>`).join('')}</div>
+    <div class="chips">${['All', ...cats()].map((c) => `<button class="chip ${cat === c ? 'active' : ''}" data-action="board-cat" data-v="${c}">${c}</button>`).join('')}</div>
     <div class="chips">${['All', 'P1', 'P2', 'P3'].map((p) => `<button class="chip ${prio === p ? 'active' : ''}" data-action="board-prio" data-v="${p}">${p}</button>`).join('')}
       <span class="muted mono" style="font-size:12px;margin-left:6px">${items.length}/${S.tasks.length} tasks</span></div>
   </div>
@@ -454,16 +493,16 @@ PAGES['/deals'] = () => {
 };
 
 // ---------------------------------------------------------------- Skills
-PAGES['/skills'] = () => `${head('Skills', 'Reusable playbooks in .claude/skills/')}
+PAGES['/skills'] = () => `${head('Skills', 'Your skills from ~/.claude/skills and your projects')}
   <div class="grid-cards">
     ${S.skills.map((s, i) => `
       <button class="card agent-card" data-action="show-skill" data-i="${i}">
         <div style="display:flex;align-items:center;gap:8px">${icon('spark')}<b style="font-size:13.5px">${esc(s.name)}</b></div>
         <div class="desc">${esc(s.description)}</div>
-        <div class="chips" style="margin-top:10px">${s.agents.map((a) => `<span class="tag tag-blue">${esc(a)}</span>`).join('')}</div>
+        <div class="chips" style="margin-top:10px"><span class="tag">${esc(s.source)}</span>${s.agents.map((a) => `<span class="tag tag-blue">${esc(a)}</span>`).join('')}</div>
       </button>`).join('') || '<div class="empty">No skills yet.</div>'}
   </div>
-  <p class="muted" style="font-size:12.5px;margin-top:18px">Add a skill: create <code class="inline">.claude/skills/&lt;name&gt;/SKILL.md</code> with a <code class="inline">name</code> and <code class="inline">description</code> frontmatter. It appears here instantly.</p>`;
+  <p class="muted" style="font-size:12.5px;margin-top:18px">Add a skill: create <code class="inline">~/.claude/skills/&lt;name&gt;/SKILL.md</code> (or inside a project's <code class="inline">.claude/</code>) with a <code class="inline">name</code> and <code class="inline">description</code> frontmatter. It appears here instantly.</p>`;
 
 // ---------------------------------------------------------------- Analytics
 function hbar(id, title, hint, rows, fmt = (v) => v) {
@@ -555,7 +594,7 @@ PAGES['/logs'] = () => {
   <section class="card card-pad">
     ${groups.map((g) => `<div class="log-group"><h3 class="log-hour">${esc(g.key)}</h3><ul class="log-list">
       ${g.items.map((l) => `<li class="log-item ${l.agent === 'system' ? 'sys' : ''}">
-        <div class="log-head"><span class="log-time">${fmtTime(l.ts)}</span><span class="tag ${l.agent === 'system' ? '' : 'tag-blue'}">${esc(l.agent)}</span></div>
+        <div class="log-head"><span class="log-time">${fmtTime(l.ts)}</span><span class="tag ${l.agent === 'system' ? '' : 'tag-blue'}">${esc(l.agent)}</span>${l.project ? `<span class="muted" style="font-size:11.5px">${esc(l.project)}</span>` : ''}</div>
         <div class="log-msg">${esc(l.message)}</div>${l.detail ? `<div class="log-detail">${esc(l.detail)}</div>` : ''}</li>`).join('')}
     </ul></div>`).join('') || '<div class="empty">No events for this filter.</div>'}
   </section>`;
@@ -581,8 +620,30 @@ PAGES['/memory'] = () => {
 // ---------------------------------------------------------------- Settings
 PAGES['/settings'] = () => {
   const s = S.settings;
+  const hidden = s.hiddenPages || [];
+  const manual = s.projects || [];
+  const hooksCmd = 'npm run install-hooks';
   return `${head('Settings', 'Workspace configuration')}
   <div class="settings">
+    <section class="card card-pad">
+      <h2 class="section-title">${icon('activity')} Automatic tracking</h2>
+      ${S.system.hooksInstalled
+        ? `<p style="margin:0;font-size:13px"><span class="dot dot-good"></span> Installed. Every time Claude Code launches one of your agents, it shows up here live.</p>`
+        : `<p style="margin-top:0;font-size:13px"><span class="dot dot-warning"></span> Not installed yet. In a terminal, inside the <code class="inline">mission-control</code> folder, run:</p>
+           <pre style="font:12px var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;margin:0">${hooksCmd}</pre>
+           <p class="muted" style="font-size:12.5px;margin-bottom:0">It adds 3 hooks to <code class="inline">${esc(S.system.claudeHome)}/settings.json</code> (a backup is saved). Restart Claude Code afterwards. Undo with <code class="inline">npm run uninstall-hooks</code>.</p>`}
+    </section>
+    <section class="card card-pad">
+      <h2 class="section-title">${icon('bot')} Where your agents come from</h2>
+      <table class="table"><thead><tr><th>Source</th><th>Folder</th><th></th></tr></thead><tbody>
+        ${S.sources.map((src) => `<tr><td>${esc(src.label)}${src.missing ? ' <span class="tag tag-yellow">no .claude/agents</span>' : ''}</td><td class="mono" style="font-size:11.5px;word-break:break-all">${esc(src.root)}</td>
+          <td>${src.auto ? '<span class="muted" style="font-size:11.5px">auto</span>' : `<button class="icon-btn" data-action="remove-project" data-path="${esc(src.root)}" aria-label="Remove">${icon('x')}</button>`}</td></tr>`).join('')}
+        ${manual.filter((p) => !S.sources.some((src) => src.root === p || src.root.endsWith(p))).map((p) => `<tr><td>${esc(p)} <span class="tag tag-red">not found</span></td><td></td><td><button class="icon-btn" data-action="remove-project" data-path="${esc(p)}" aria-label="Remove">${icon('x')}</button></td></tr>`).join('')}
+      </tbody></table>
+      <p class="muted" style="font-size:12.5px">Global agents and every project you opened with Claude Code are detected automatically. Add another folder (full path):</p>
+      <form data-form="add-project" class="chips"><input class="search" name="path" placeholder="${S.system.platform === 'win32' ? 'C:\\Users\\you\\Documents\\my-project' : '/home/you/my-project'}" required style="flex:1">
+        <button class="btn" type="submit">${icon('plus')} Add folder</button></form>
+    </section>
     <section class="card card-pad">
       <h2 class="section-title">Workspace</h2>
       <form data-form="settings">
@@ -590,30 +651,31 @@ PAGES['/settings'] = () => {
           <div class="field"><label for="s-name">Name</label><input id="s-name" name="name" value="${esc(s.name)}" maxlength="24"></div>
           <div class="field"><label for="s-owner">Owner</label><input id="s-owner" name="owner" value="${esc(s.owner)}" placeholder="Your name"></div>
         </div>
+        <div class="field"><label for="s-cats">Task categories (comma separated)</label><input id="s-cats" name="categories" value="${esc(cats().join(', '))}"></div>
         <div class="field-row">
           <div class="field"><label for="s-cur">Currency</label><select id="s-cur" name="currency">${['USD', 'EUR', 'MAD', 'GBP', 'CAD'].map((c) => `<option ${c === s.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
           <div class="field"><label for="s-theme">Theme</label><select id="s-theme" name="theme">${['system', 'light', 'dark'].map((c) => `<option ${c === s.theme ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
         </div>
+        <div class="field"><label>Pages</label><div class="chips">
+          ${NAV.filter(([href]) => !ALWAYS_VISIBLE.includes(href)).map(([href, label]) => `<label class="chip" style="cursor:pointer"><input type="checkbox" name="page:${href}" ${hidden.includes(href) ? '' : 'checked'}> ${label}</label>`).join('')}
+        </div></div>
         <button class="btn btn-primary" type="submit">Save</button>
       </form>
     </section>
     <section class="card card-pad">
-      <h2 class="section-title">Connect your agents</h2>
-      <p style="margin-top:0;font-size:13px">Your Claude Code agents update this dashboard by running the CLI from the project folder:</p>
-      <pre style="white-space:pre-wrap;font:12px/1.6 var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;margin:0">node scripts/mc.js log content-agent "Script du reel terminé"
-node scripts/mc.js task add "Relire la newsletter" --priority P1 --category Newsletter
-node scripts/mc.js task move "newsletter" done
-node scripts/mc.js content move "Claude Dispatch" posted
-node scripts/mc.js deal add "Acme" "Atelier IA" 1500
+      <h2 class="section-title">Command line</h2>
+      <p style="margin-top:0;font-size:13px">You (or your agents) can also add tasks and logs from a terminal, in the mission-control folder:</p>
+      <pre style="white-space:pre-wrap;font:12px/1.6 var(--mono);background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:10px;margin:0">node scripts/mc.js task add "Backtest stratégie EMA" --category Trading --priority P1
+node scripts/mc.js task move "Backtest" done
+node scripts/mc.js log mon-agent "Analyse BTC terminée"
 node scripts/mc.js summary</pre>
-      <p class="muted" style="font-size:12.5px;margin-bottom:0">Changes to <code class="inline">data/state.json</code>, <code class="inline">.claude/agents/</code> and <code class="inline">.claude/skills/</code> show up here live.</p>
     </section>
     <section class="card card-pad">
       <h2 class="section-title">Data</h2>
       <div class="chips">
         <button class="btn" data-action="export">${icon('download')} Export JSON</button>
         <label class="btn">${icon('upload')} Import JSON<input type="file" accept="application/json" data-action="import" hidden></label>
-        <button class="btn btn-danger" data-action="reset">Reset demo data</button>
+        <button class="btn btn-danger" data-action="reset">Clear tasks & logs</button>
       </div>
     </section>
   </div>`;
@@ -652,7 +714,7 @@ function taskModal(t = {}, status) {
   openModal(`<h2>${isEdit ? 'Edit task' : 'New task'}</h2><form>
     <div class="field"><label for="f-title">Title</label><input id="f-title" name="title" required value="${esc(t.title)}"></div>
     <div class="field-row">
-      <div class="field"><label for="f-cat">Category</label><select id="f-cat" name="category">${opt(CATEGORIES, t.category || 'Content')}</select></div>
+      <div class="field"><label for="f-cat">Category</label><select id="f-cat" name="category">${opt([...new Set([...cats(), ...(t.category ? [t.category] : [])])], t.category || cats()[0])}</select></div>
       <div class="field"><label for="f-prio">Priority</label><select id="f-prio" name="priority">${opt(['P1', 'P2', 'P3'], t.priority || 'P2')}</select></div>
     </div>
     <div class="field-row">
@@ -722,7 +784,7 @@ const ACTIONS = {
   'board-prio': (el) => { ui.board.prio = el.dataset.v; render(); },
   'logs-range': (el) => { ui.logs.range = el.dataset.v; render(); },
   'logs-agent': (el) => { ui.logs.agent = el.dataset.v; render(); },
-  'select-agent': (el) => { ui.agents.selected = ui.agents.selected === el.dataset.name ? null : el.dataset.name; render(); },
+  'select-agent': (el) => { ui.agents.selected = ui.agents.selected === el.dataset.id ? null : el.dataset.id; render(); },
   'toggle-table': (el) => { ui.analytics.table[el.dataset.id] = !ui.analytics.table[el.dataset.id]; render(); },
   'show-skill': (el) => {
     const s = S.skills[Number(el.dataset.i)];
@@ -732,14 +794,15 @@ const ACTIONS = {
       <div class="modal-actions"><button class="btn" data-close>Close</button></div>`);
   },
   export: () => {
-    const { agents, skills, serverTime, ...data } = S;
+    const { agents, skills, sources, system, serverTime, ...data } = S;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
     a.download = `mission-control-${ymd(new Date())}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
   },
-  reset: () => { if (confirm('Replace all data with the demo data?')) mutate('reset', 'POST', null, 'Demo data restored'); },
+  reset: () => { if (confirm('Delete all tasks, logs, content, deals and memory? (Settings are kept.)')) mutate('reset', 'POST', null, 'Cleared'); },
+  'remove-project': (el) => mutate('settings', 'PATCH', { projects: (S.settings.projects || []).filter((p) => p !== el.dataset.path && !el.dataset.path.endsWith(p)) }, 'Folder removed'),
 };
 
 document.addEventListener('click', (e) => {
@@ -754,7 +817,7 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('change', async (e) => {
   const el = e.target;
-  if (el.dataset.action === 'agent-status') mutate(`agents/${encodeURIComponent(el.dataset.name)}`, 'PATCH', { status: el.value }, 'Status updated');
+  if (el.dataset.action === 'agent-status' && el.value) mutate(`agents/${encodeURIComponent(el.dataset.name)}`, 'PATCH', { status: el.value }, 'Status updated');
   if (el.dataset.action === 'import' && el.files[0]) {
     try {
       const data = JSON.parse(await el.files[0].text());
@@ -777,9 +840,20 @@ document.addEventListener('input', (e) => {
   }, 150);
 });
 document.addEventListener('submit', (e) => {
-  if (e.target.dataset.form !== 'settings') return;
-  e.preventDefault();
-  mutate('settings', 'PATCH', Object.fromEntries(new FormData(e.target)), 'Settings saved');
+  const form = e.target.dataset.form;
+  if (form === 'settings') {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const body = {};
+    for (const k of ['name', 'owner', 'currency', 'theme']) body[k] = fd.get(k);
+    body.categories = String(fd.get('categories') || '').split(',').map((x) => x.trim()).filter(Boolean);
+    body.hiddenPages = NAV.map(([href]) => href).filter((href) => !ALWAYS_VISIBLE.includes(href) && !fd.has(`page:${href}`));
+    mutate('settings', 'PATCH', body, 'Settings saved');
+  } else if (form === 'add-project') {
+    e.preventDefault();
+    const p = String(new FormData(e.target).get('path') || '').trim();
+    if (p) mutate('settings', 'PATCH', { projects: [...new Set([...(S.settings.projects || []), p])] }, 'Folder added');
+  }
 });
 window.addEventListener('popstate', render);
 
